@@ -1,7 +1,9 @@
 # 无密码的 clip：谁都能改（取消 owner token 的独家写权限）
 
-**Status:** 💭 PROPOSAL —— **待人类一句话确认** · **Date:** 2026-10-16
-· **Deciders:** 用户（原话见下）· **Supersedes:** clip 现有硬约定「读是匿名的，**写要 owner token**」
+**Status:** ✅ ACCEPTED —— 采纳 **A（无密码 = 谁都能改，密码是唯一凭证）**
+· **Date:** 2026-10-16 · **Deciders:** 用户（选了「A. 无密码谁都能改」，并确认为此删掉整个
+owner_token：字段 / `X-Relay-Clip-Token` 头 / localStorage / 契约测试）
+· **Supersedes:** clip 现有硬约定「读是匿名的，**写要 owner token**」
 （`AGENTS.md`、`internal/clip/suffix.go` 包注释、README 第 2 步）
 · **Related:** `2026-10-16-clip-access-password.md`
 
@@ -53,12 +55,35 @@
 
 ## 决定
 
-<!-- 待人类裁决：A / B / C。若是 A，下面这些要同一次改动里一起改：
-     - AGENTS.md 硬约定、suffix.go 包注释、README（“这个后缀就是你的了”那段）
-     - 删 owner_token 响应字段 / X-Relay-Clip-Token 头 / 页面 localStorage / 契约测试
-     - 新增“抢注”行为的用户可见说明
--->
-**待裁决。**
+**采纳 A。** 这条规则从今天起成立，写成规则而不是偏好：
+
+- **密码是唯一的凭据。** 没有第二把钥匙，也不再发 `owner_token`。
+- **无密码的 clip**：任何人都可以读、可以写、可以给它设密码。
+- **有密码的 clip**：只有知道密码的人能读、能写、能改密码。
+- **谁先设密码谁就是主人**（“谁先来占这个位置，那就是谁的”）。
+
+三条已知代价，用户看过并接受：
+
+1. 公开 clip 从「防涂改」变成「可涂改」；
+2. 任何人都能给别人的公开后缀**抢注**一个密码，把原作者锁在外面；
+3. 存量浏览器里的 `owner_token` 一律失效（因为无密码的 clip 本来就变成谁都可写，
+   **不是数据损失**，但发布说明要写一句）。
+
+### 删什么（同一次改动）
+
+- `clips.owner_token_hash` 列、创建时回传的 `owner_token` 字段、`X-Relay-Clip-Token` 头；
+- SQL 里的 `hashOwnerToken(...)` 所有权 `WHERE` 判定（换成密码校验；无密码时不过滤）；
+- 页面 `localStorage` 里的 token 逻辑，以及 `TestClientReadsTheFieldNamesTheServerWrites`
+  对 `owner_token` 的断言；
+- `scripts/verify-clip-browser.cjs` 里所有以 token 为前提的写权限断言（要按新语义重写）。
+
+### 写权限之后的形状
+
+| 谁能写 | 读 | 写 |
+| --- | --- | --- |
+| 任何人（无密码 clip） | ✅ | ✅（不需要任何凭据） |
+| 知道密码的人 | ✅ | ✅ |
+| 不知道密码的人 | ❌ | ❌ |
 
 ## 后果（若选 A）
 

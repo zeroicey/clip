@@ -2,20 +2,21 @@
 
 **Status:** ✅ **已上线并验证** —— 路由缺陷（HEAD 掉进 NoRoute）已修、已提交、已部署；
 线上 `version` = `13ad95d`（从**干净树**构建，可追溯）。
-**下一步（设计已写，部分待一句话确认）**：定位 = **webnote.cc 的开源版本**。
-密码机制已 ✅ 裁决；归属/写权限与分享链接两张提案待裁决。
+**下一步（三份设计已 ✅ 裁决，开始实现第一步）**：定位 = **webnote.cc 的开源版本**。
 
 - ✅ `.ai/decisions/2026-10-16-clip-access-password.md` —— 服务端 argon2id 哈希、
   **挡全部 4 条读路径（含 `/raw`）**、unlock 接口 + `X-Clip-Password` 头、
   **忘密码不可恢复**、设/改密码要过所有权判定、过期即回收后缀
-- 💭 `.ai/decisions/2026-10-16-clip-open-edit-and-ownership.md` —— **待确认**：
-  无密码的 clip 是不是真的“谁都能改”（这会推翻现有「写要 owner token」硬约定）
-- 💭 `.ai/decisions/2026-10-16-clip-share-links.md` —— 待裁决：`/s/<token>` 只读分享路由、
-  分享口令 vs 6 位取件码、分享与主密码的关系
+- ✅ `.ai/decisions/2026-10-16-clip-open-edit-and-ownership.md` —— **无密码 = 谁都能改**，
+  密码是唯一凭据，**owner_token 整套删掉**（推翻了 AGENTS.md 的旧硬约定）
+- ✅ `.ai/decisions/2026-10-16-clip-share-links.md` —— `/s/<token>` 只读分享；分享密码
+  **与** 6 位取件码都要；分享口令独立于主密码；可撤销 + TTL
 
-**本次确认的其余范围**：LICENSE（稀疏）、自动保存（对齐 webnote）。
+**本次确认的其余范围**：LICENSE = **MIT**；自动保存要做。
 用户明确**不要**随机后缀生成（“我本身就需要一个专属我自己的名字…要是给我来个随机后缀，
 我可能就要对着屏幕去敲了”）。
+
+**顺序（用户选的）**：① 密码（含 MIT LICENSE + 自动保存）→ 上线验证 → ② 分享链接。
 
 **Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-clip-split-and-launch-handoff.md`
 
@@ -80,14 +81,13 @@ teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.
 
 ### ⚠️ 定位变了就要改的硬约定
 
-「**后缀是公屏，不是密码**」目前写在本文件、AGENTS.md、README 与页面文案里。加密码后它对
-**无密码的 clip 仍然成立**，但它不再是完整描述 —— 四处文案必须与代码在同一次改动里改掉，
-否则记忆库与代码矛盾（这正是 bank 契约里说的 stale 情形）。
+两条都要改，且**已经裁决**（不是待定）：
 
-另有一条更硬的要被推翻：**「写要 owner token」**。用户描述的模型里，无密码的 clip 谁都
-能改、密码就是单一把手钥匙（“谁拿到密码谁就是主人”）。这条影响 AGENTS.md 的硬约定、
-`suffix.go` 的包注释、README、跨语言契约测试（`owner_token` 字段）与整个页面的 localStorage 逻辑，
-所以单独开了一份提案等一句确认，**不要默默改掉**。
+1. 「**后缀是公屏，不是密码**」—— 加密码后它只对**无密码的 clip** 继续成立。
+   AGENTS.md、README、页面文案、本文件要一起改。
+2. 「**写要 owner token**」—— **整条废除**。无密码的 clip 谁都能改，密码是唯一凭据。
+   AGENTS.md 硬约定、`suffix.go` 包注释、README、`owner_token` 契约测试、页面 localStorage
+   逻辑都在这条上。
 
 ---
 
