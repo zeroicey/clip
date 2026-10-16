@@ -1,7 +1,7 @@
 # Current task
 
-**Status:** ⏳ **UI 大换皮：已实现、全部验证通过、人类已看过截图并批准提交/部署**。
-线上仍是 **`172ea54`**（步骤 ①② 已上线）。本轮只改了视觉层（未改任何 id、未改任何被断言的文案、未改行为）。
+**Status:** ✅ **UI 大换皮已上线并验证** —— 线上 = **`fc88ac7`**（干净树构建，可追溯）。
+本轮只改了视觉层（未改任何 id、未改任何被断言的文案、未改行为）。
 **更新：** 2026-10-16（第四会话）· **设计决策：** `.ai/decisions/2026-10-16-ui-visual-direction.md`
 
 ## 本轮：UI 大换皮（「工作台仪表」）
@@ -75,6 +75,7 @@
 | **Tab 顺序 + 焦点环**（真实按键，非 `el.focus()`） | ✅ 每态 3–11 站，顺序合理（品牌 → 正文 → 主操作 → 次操作 → 折叠区），**焦点环全部画出** |
 | DOM 几何审计 | ✅ 无页面级横向溢出；无文字被裁；唯一的「小目标」是 checkbox（其**包裹 label 是 36px**，误报） |
 | 截图 | `bin/e2e/uifinal/`（gitignore）与 `/tmp/ui-shots/`：landing / 编辑器（空·有内容）/ 锁定 / 分享 × 明暗 × 桌面+390px，共 26 张 |
+| **人类过目截图** | ✅ 裁决「Looks good as-is」（2026-10-16） |
 
 **关键取证（本机 8797，真库 `relay_test`）**：
 
@@ -88,6 +89,31 @@ node scripts/verify-clip-browser.cjs http://127.0.0.1:8797   # 75/75
 
 （**注意**：`127.0.0.1:8799` 被隔壁 teleport 的进程占着 —— 换 8797。）
 
+### ✅ 已部署并线上验证（2026-10-16，提交 `fc88ac7`）
+
+从**干净工作区**构建（构建前 `git status --porcelain` 为空），线上 `version` = **`fc88ac7`** = HEAD。
+
+| 项 | 结果 |
+| --- | --- |
+| 升级前冷备 | ✅ `/data/backups/clip-20261016-203338.dump`，`pg_restore -l` 可读（**21 个 TOC 项**，`dbname: relay`） |
+| 回滚副本 | ✅ `/data/backups/clip-binary-prefc88ac7`（部署前那份二进制） |
+| runbook (a) 本机直连 | ✅ 200 |
+| runbook (b) 隧道那一跳 + caddy wget | ✅ 200 / `REACHABLE` |
+| runbook (c) 公网 HEAD + 证书 | ✅ `verify=0 http=200` |
+| runbook (d) 契约形状 | ✅ `/api/nope`=JSON、`/a/b/c`=text/plain、`/neversuch`=200、`HEAD /robots.txt`=200、`POST /ops1`=405 |
+| runbook (e)+(f) 产品码 | ✅ **19/19**（密码 8 项 + 分享 9 项 + 清理 2 项）—— 含**分享口令能开、主密码打不开**、锁壳不含正文、不回显后缀、`POST /s/...`=405、撤销即死 404 |
+| runbook (h) **真浏览器打线上** | ✅ **75/75 连跑 2 次全绿**（每次前 `systemctl restart clip` 清写限流器）；两次都 0 失败项 |
+| runbook (i) 可追溯 | ✅ `version` 在历史里；`fc88ac7..HEAD` 无 `cmd/ internal/ scripts/` 改动 |
+| 大陆观测点 hcyj / koma | ✅ 均 `verify=0 http=200`，`/s/<未知>` = 404 |
+| 线上 CSP 未松动 | ✅ 仍是 `nonce-…`，`unsafe-inline` 出现 **0** 次 |
+| **线上确实跑的是新 UI** | ✅ 新 token 全部命中（`--edge`/`--seam`/`tabular-nums`/`class="dot"`/`class="bar"`/`class="brandline"`/`:where(...):focus-visible`），旧 `#1f6feb` 出现 **0** 次 |
+
+**一次真实故障（不是产品缺陷）**：线上真浏览器第一次跑在 “save button stayed visible” 之后
+以 `verification crashed: fetch failed` 挂了（Node 自己的 fetch 传输层错误，不是断言失败）。
+当时从本机 `node fetch` 三个路径都 200，重启进程后连跑两次均 **75/75**。
+即：**经 frp 隧道的一次瞬时传输失败**，与页面无关。
+（下次碰到：先看退出码与最后一条 PASS；`fetch failed` 不是断言。）
+
 ### ⚠️ 未做 / 需要人类动作
 
 1. ✅ **人眼已看截图并裁决「Looks good as-is」**（2026-10-16，用户原话）。
@@ -98,7 +124,7 @@ node scripts/verify-clip-browser.cjs http://127.0.0.1:8797   # 75/75
    **判错了** —— `outline-offset:2px` 让环对着页面底色测量（5.51:1），而它建议的改法
    （换成 on-accent 色）反而会降到 1.05:1。
 2. ✅ **已问过人类并获批准**：commit 本换皮（**不动**锁定页那个既有缺陷）→ 再构建/部署/线上验证。
-3. ⏳ **部署后**必须拿同一份脚本**再打一次线上**（本机绿 ≠ 线上绿）。
+3. ✅ **部署后已拿同一份脚本再打一次线上** —— **75/75 连跑 2 次**（详见下方「已部署并线上验证」）。
 4. **既有缺陷（不是本轮引入，未修 —— 用户裁决留作后续）**：锁定态下 `<details class="meta">` 仍渲染
    「新密码 / 设置 / 去掉密码」—— 此刻点任何一个都必然 401。修它要动 `paint()` 状态机
    （锁定/解锁转换），而那个区域是本仓库陷阱最密集的地方，故本轮不动，只记录。
