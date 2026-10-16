@@ -476,9 +476,22 @@ async function main() {
       await writer.eval('document.getElementById("sharestatus").textContent'));
     failThrottled('POST shares', shareCreated ? 0 : 429);
 
+    // The list is rendered from a follow-up GET, so wait for the anchor rather than
+    // reading it right after the status text. Without this the test is a race: on a
+    // slow link (the deployed service, measured at ~100ms RTT) the href was still
+    // empty when it was read, and the run then crashed navigating to "".
+    const shareListed = await waitFor(writer, '!!document.querySelector("#sharelist a")', 20000);
+    check('the new share appears in the owner\'s list', shareListed,
+      await writer.eval('document.getElementById("sharelist").textContent'));
     const shareURL = await writer.eval('document.querySelector("#sharelist a")?.href || ""');
-    check('the share link has the /s/<token> shape', /\/s\/[A-Za-z0-9_-]{16,}$/.test(shareURL), shareURL);
-    const shareToken = shareURL.split('/s/')[1] || '';
+    if (!/\/s\/[A-Za-z0-9_-]{16,}$/.test(shareURL)) {
+      // Stop with a readable reason. Continuing would call Page.navigate with an
+      // empty URL and report Chrome's "Cannot navigate to invalid URL" instead of
+      // the real problem (the owner page produced no usable link).
+      throw new Error(`the owner page produced no usable share URL: ${JSON.stringify(shareURL)}`);
+    }
+    check('the share link has the /s/<token> shape', true, shareURL);
+    const shareToken = shareURL.split('/s/')[1];
 
     // A fresh browser with no sessionStorage: this is what a colleague gets.
     const sharer = await newPage(port);
@@ -582,8 +595,11 @@ async function main() {
       'document.getElementById("sharecodeout").hidden === false', 20000);
     const code = await writer.eval('document.getElementById("sharecodevalue").value');
     check('a pickup-code share shows a 6-digit code', codeShown && /^[0-9]{6}$/.test(code), code);
+    // Same follow-up-GET race as above: wait for the anchor, do not assume it.
+    await waitFor(writer, '!!document.querySelector("#sharelist a")', 20000);
     const codeURL = await writer.eval('document.querySelector("#sharelist a")?.href || ""');
     const codeToken = codeURL.split('/s/')[1] || '';
+    if (!codeToken) throw new Error(`the owner page produced no usable share URL for the code share: ${JSON.stringify(codeURL)}`);
     check('the pickup code opens the share',
       (await fetchStatus(`${BASE}/s/${codeToken}/raw`, { 'X-Clip-Password': code })) === 200,
       `status with code ${code}`);

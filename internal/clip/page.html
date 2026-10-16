@@ -677,8 +677,12 @@ details.meta summary{cursor:pointer}
       if (shareCodeOut) shareCodeOut.hidden = !d.code;
       if (d.code && shareCodeValue) shareCodeValue.value = d.code;
       sharePw.value = "";
+      // Reload the list BEFORE reporting success. Otherwise "已创建" appears
+      // while the list still shows the old contents, and anything that looks for
+      // the new link right after the status (a test, or a person who clicks copy
+      // immediately) sees a stale — or, on a slow link, empty — list.
+      await loadShares();
       shareSay(d.code ? "已创建：把取件码和链接分别告诉对方，取件码只显示这一次。" : "已创建只读分享链接。", "ok");
-      loadShares();
       return;
     }
     shareSay(r.json && r.json.error ? r.json.error.message : "创建失败（HTTP " + r.status + "）。", "err");
@@ -687,7 +691,7 @@ details.meta summary{cursor:pointer}
   async function revokeShare(token) {
     if (!confirm("撤销这个分享链接？对方马上就不能再看了。")) return;
     var r = await api("DELETE", "/shares/" + encodeURIComponent(token));
-    if (r.status === 204) { shareSay("已撤销。", "ok"); loadShares(); return; }
+    if (r.status === 204) { await loadShares(); shareSay("已撤销。", "ok"); return; }
     shareSay(r.json && r.json.error ? r.json.error.message : "撤销失败（HTTP " + r.status + "）。", "err");
   }
 
