@@ -10,99 +10,276 @@
 <meta name="color-scheme" content="light dark">
 <title>{{.Title}} · Relay 网络剪贴板</title>
 <style nonce="{{.Nonce}}">
-/* Deliberately self-contained: no webfont, no shared stylesheet, no build step.
+/* ---------------------------------------------------------------------------
+   Relay 网络剪贴板 — "bench instrument".
+
+   The subject is a transfer tool, not a document: one piece of text that has to
+   exist on two machines at once, moved by someone with a terminal already open.
+   So the surface vocabulary is an instrument panel rather than a card stack —
+   hairline seams for structure, a real 3:1 boundary on anything you can type
+   into, and ONE signal colour reserved for whatever is live (saving, syncing,
+   unlocked). Amber is kept for caution and nothing else, because that is what
+   amber means to everyone already.
+
+   Two rules this file exists to keep true:
+     - monospace is for the payload and for addresses only. Every readout is the
+       UI sans with tabular figures, so "mono" on screen always means "this is
+       the thing being transferred".
+     - colour never carries state on its own. Every state also has a shape or a
+       word beside it (the status lamp, the button label, the "…" in the text).
+
+   Deliberately self-contained: no webfont, no shared stylesheet, no build step.
    This page has to render on whatever machine happens to have a browser, so it
-   depends on nothing but the HTML the server just sent. */
+   depends on nothing but the HTML the server just sent.
+
+   Colour pairs are not eyeballed: every text pair below clears WCAG AA (4.5:1)
+   and every control boundary clears 3:1 against the surface it sits on. The two
+   greys are deliberately different tokens — --seam is a divider (visual only),
+   --edge is a control boundary (measured).
+   --------------------------------------------------------------------------- */
 :root{
-  --bg:#f6f7f9; --fg:#14161a; --muted:#5c6470; --line:#d8dce3;
-  --card:#fff; --accent:#1f6feb; --accent-fg:#fff; --warn:#a3520a; --err:#b3261e;
+  /* light: drafting stock */
+  --bg:#f2f4f4; --surface:#fff; --surface-2:#eaeeef;
+  --seam:#d3dadd;      /* divider only */
+  --edge:#77868b;      /* control boundary: 3.77:1 on surface, 3.42:1 on bg */
+  --fg:#12181a; --muted:#5c686c;
+  --accent:#0d6e69; --accent-hover:#0a5a56; --on-accent:#fff;
+  --warn:#8a5a12; --err:#b3261e;
+  --img-outline:rgb(0 0 0 / .12);
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,"JetBrains Mono",monospace;
+  /* outer radius = inner radius + padding + border width, so a panel that wraps
+     a control curves concentrically instead of fighting it. */
+  --r-ctl:8px; --r-panel:19px; --r-panel-lg:23px;
+  --tap:36px;
 }
 @media (prefers-color-scheme:dark){
-  :root{--bg:#0f1115;--fg:#e8eaee;--muted:#9aa3b0;--line:#272c34;--card:#161a20;
-        --accent:#4c8dff;--accent-fg:#0b0d10;--warn:#e0a458;--err:#ff6b60;}
+  :root{
+    /* dark: the workspace this tool is used from */
+    --bg:#0e1113; --surface:#171b1e; --surface-2:#20272b;
+    --seam:#333b40;
+    --edge:#68747a;    /* 3.60:1 on surface, 3.94:1 on bg */
+    --fg:#e6e9e9; --muted:#8d989c;
+    --accent:#35c9c0; --accent-hover:#4ad6cd; --on-accent:#06201f;
+    --warn:#e0a24a; --err:#ff6b5e;
+    --img-outline:rgb(255 255 255 / .12);
+  }
 }
 *{box-sizing:border-box}
+/* A [hidden] element stays hidden whatever `display` another rule gives it.
+   Without the !important, giving a control `display:inline-flex` silently
+   overrides the UA's own [hidden] rule — and the read-only share page grows a
+   Save button again, which is a page lying about its own guarantees. */
+[hidden]{display:none!important}
 html,body{margin:0;height:100%}
 body{
   background:var(--bg);color:var(--fg);
-  font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
+  font:15px/1.55 var(--sans);
   display:flex;flex-direction:column;
+  -webkit-tap-highlight-color:transparent;
 }
-header{
-  display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;
-  padding:14px 18px;border-bottom:1px solid var(--line);
+/* selection is this product's primary gesture ("select all, paste on the other
+   machine"), so it gets the accent rather than the browser's default. */
+::selection{background:var(--accent);color:var(--on-accent)}
+
+/* One focus ring for everything focusable, written explicitly rather than left to
+   the UA default: the default ring is a different colour and weight on every
+   engine, and it disappears the moment someone writes `outline:none` somewhere.
+   :where() holds the specificity at zero so a component can still override its
+   own. The 2px offset is load-bearing on the accent-filled primary button: the
+   gap means the ring is measured against the page background (5.5:1 light,
+   9.3:1 dark) instead of against the accent face it would vanish into. */
+:where(a,button,input,textarea,summary,label.file):focus-visible{
+  outline:2px solid var(--accent);outline-offset:2px;
 }
-.brand{font-weight:650;text-decoration:none;color:inherit}
-.brand span{color:var(--muted);font-weight:400;font-size:13px}
+
+/* ---- nameplate rail ------------------------------------------------------- */
+header{background:var(--surface);border-bottom:1px solid var(--seam)}
+.bar{
+  max-width:1080px;margin:0 auto;padding:11px 18px;
+  display:flex;gap:8px 16px;align-items:center;flex-wrap:wrap;
+}
+/* The product name is the page's only heading: this surface has no document
+   title of its own, so a screen-reader user navigating by heading would
+   otherwise find nothing to orient on. */
+.brandline{margin:0;font:inherit;font-weight:600}
+.brand{font-weight:600;font-size:15px;text-decoration:none;color:inherit;white-space:nowrap}
+.brand span{color:var(--muted);font-weight:400;font-size:13px;margin-left:7px}
 .addr{
-  font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,"JetBrains Mono",monospace;
-  color:var(--muted);word-break:break-all;
+  margin-left:auto;
+  font-family:var(--mono);font-size:12.5px;line-height:1.4;color:var(--muted);
+  background:var(--bg);border:1px solid var(--seam);border-radius:6px;padding:4px 9px;
+  word-break:break-all;max-width:100%;
 }
-main{flex:1;display:flex;flex-direction:column;gap:12px;padding:16px 18px 28px;min-height:0}
-.hint{margin:0;color:var(--muted);font-size:13.5px}
+
+/* ---- body ---------------------------------------------------------------- */
+main{
+  flex:1;display:flex;flex-direction:column;gap:14px;
+  width:100%;max-width:1080px;margin:0 auto;padding:18px 18px 32px;min-height:0;
+}
+.hint{margin:0;color:var(--muted);font-size:13.5px;max-width:78ch}
 .hint b{color:var(--warn);font-weight:600}
+
+/* The editor column is a flex column so the textarea can claim whatever height
+   the viewport has left over — the payload is the page. */
+#content{display:flex;flex-direction:column;gap:12px;flex:1;min-height:0}
+#content[hidden]{display:none}
+
 textarea{
   flex:1;min-height:220px;width:100%;resize:vertical;
-  padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--card);
-  color:var(--fg);
-  font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,"JetBrains Mono",monospace;
+  padding:14px;border:1px solid var(--edge);border-radius:var(--r-ctl);
+  background:var(--surface);color:var(--fg);caret-color:var(--accent);
+  font:13.5px/1.6 var(--mono);
   /* A transfer buffer is expected to hold lines that must not be re-wrapped:
      a reflowed log line or command is a subtly corrupted one. */
   white-space:pre;overflow:auto;tab-size:4;
 }
-textarea:read-only{background:color-mix(in srgb,var(--card) 70%,var(--bg))}
-textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+textarea:read-only{background:var(--surface-2)}
+
+/* ---- controls ------------------------------------------------------------ */
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 button,label.file{
-  appearance:none;border:1px solid var(--line);background:var(--card);color:var(--fg);
-  border-radius:8px;padding:9px 14px;font:inherit;font-size:14px;cursor:pointer;
-  /* 32px minimum: the accessibility pass on the dashboard settled on this, and a
-     touch device is a plausible second machine for this feature. */
-  min-height:36px;
+  appearance:none;border:1px solid var(--edge);background:var(--surface);color:var(--fg);
+  border-radius:var(--r-ctl);padding:8px 14px;font:inherit;font-size:14px;cursor:pointer;
+  /* 36px minimum: a touch device is a plausible second machine for this feature. */
+  min-height:var(--tap);
+  transition-property:background-color,border-color,color,transform;
+  transition-duration:150ms;transition-timing-function:ease-out;
 }
-button:hover,label.file:hover{border-color:var(--accent)}
-button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
-button[hidden],label[hidden],div[hidden],section[hidden]{display:none}
+button.primary{
+  background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600;
+}
 button:disabled{opacity:.5;cursor:default}
-.status{margin:0;font-size:13.5px;color:var(--muted);min-height:1.4em}
+/* Hover only where a pointer can actually hover: on touch, :hover latches after
+   a tap and reads as a stuck selected state. */
+@media (hover:hover){
+  button:not(:disabled):hover,label.file:hover{background:var(--surface-2);border-color:var(--accent)}
+  button.primary:not(:disabled):hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+}
+/* Press feedback, movement only, and only for people who did not ask for less. */
+@media (prefers-reduced-motion:no-preference){
+  button:not(:disabled):active,label.file:active{transform:scale(.96)}
+}
+
+/* ---- status readout ------------------------------------------------------ */
+/* The lamp is a static cue that sits beside the words, so the state is legible
+   with the colour alone, with the motion alone, or with neither. */
+.statusline{display:flex;gap:9px;align-items:center;min-height:1.5em}
+.dot{
+  flex:none;width:7px;height:7px;border-radius:50%;background:var(--muted);
+  transition-property:background-color;transition-duration:150ms;transition-timing-function:ease-out;
+}
+.statusline[data-tone=ok] .dot{background:var(--accent)}
+.statusline[data-tone=err] .dot{background:var(--err)}
+.statusline[data-tone=busy] .dot{background:var(--accent)}
+.status{margin:0;font-size:13.5px;color:var(--muted)}
 .status[data-tone=err]{color:var(--err)}
 .status[data-tone=ok]{color:var(--accent)}
+@keyframes lamp{50%{opacity:.3}}
+@media (prefers-reduced-motion:no-preference){
+  .statusline[data-tone=busy] .dot{animation:lamp 1.4s ease-in-out infinite}
+}
+
+/* ---- images -------------------------------------------------------------- */
 figure{margin:0}
 .thumbs{display:flex;gap:10px;flex-wrap:wrap}
 .thumbs img{
-  max-width:220px;max-height:150px;border:1px solid var(--line);border-radius:8px;
-  background:var(--card);display:block;
+  max-width:220px;max-height:150px;border-radius:var(--r-ctl);
+  background:var(--surface);display:block;
+  /* An outline, not a border: it never changes the image's own size. Pure
+     black/white at 10% — a tinted or palette outline shows as a coloured fringe. */
+  outline:1px solid var(--img-outline);outline-offset:-1px;
 }
-details.meta{border-top:1px solid var(--line);padding-top:10px;font-size:13px;color:var(--muted)}
-details.meta summary{cursor:pointer}
-.meta dl{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:10px 0 0}
+
+/* ---- disclosure panels --------------------------------------------------- */
+details.meta,details.share{
+  border-top:1px solid var(--seam);padding-top:12px;font-size:13px;color:var(--muted);
+}
+details.meta summary,details.share summary{cursor:pointer;font-size:13px;color:var(--muted);padding:2px 0}
+details.meta summary:hover,details.share summary:hover{color:var(--fg)}
+.meta dl{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:10px 0 0}
 .meta dt{color:var(--muted)}
-.meta dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
-.keybox{
-  display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap;
-}
-.keybox input{
-  flex:1;min-width:220px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;
-  background:var(--card);color:var(--fg);
-  font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
-}
+/* Readouts are sans with tabular figures on purpose: mono is reserved for the
+   payload and for addresses, so a mono value on this page always means "this is
+   the thing being transferred". */
+.meta dd{margin:0;font-variant-numeric:tabular-nums;word-break:break-all}
+.meta dd a{font-family:var(--mono);color:var(--accent)}
+.meta dd a:hover{color:var(--fg)}
+b,strong{font-weight:600}
+.meta .note b{color:var(--warn)}
+
+.keybox{display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap}
 .note{color:var(--warn)}
-.sharelist{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
-.sharelist li{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
-  border:1px solid var(--line);border-radius:8px;padding:8px 10px}
-.sharelist a{color:var(--accent);text-decoration:none;word-break:break-all;flex:1;min-width:180px;
-  font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-.sharelist small{color:var(--muted)}
-.sharelist li.muted{color:var(--muted);border:0;padding:0}
-.chk{display:inline-flex;align-items:center;gap:6px;font-size:14px;min-height:36px}
-.chk input{min-height:auto}
-.lockbox{
-  border:1px solid var(--line);border-radius:10px;background:var(--card);
-  padding:16px;display:flex;flex-direction:column;gap:12px;
+code{
+  font-family:var(--mono);font-size:.92em;color:var(--fg);
+  background:var(--surface-2);border:1px solid var(--seam);border-radius:6px;padding:1px 5px;
 }
-#lockbox input[type=password]{flex:1;min-width:220px;padding:9px 11px;border:1px solid var(--line);
-  border-radius:8px;background:var(--card);color:var(--fg);font:15px/1.5 inherit}
-@media (max-width:520px){ header{padding:12px} main{padding:12px} }
+/* The curl one-liner inside a panel is something the reader has to retype, so it
+   keeps the panel's own size instead of shrinking to ~12px under the .92em. */
+details code{font-size:1em}
+
+/* ---- lock panel ---------------------------------------------------------- */
+.lockbox{
+  border:1px solid var(--seam);border-radius:var(--r-panel-lg);background:var(--surface);
+  padding:14px;display:flex;flex-direction:column;gap:12px;
+}
+
+/* ---- share list ---------------------------------------------------------- */
+.sharelist{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.sharelist li{
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  border:1px solid var(--seam);border-radius:var(--r-panel);padding:10px 12px;
+}
+.sharelist a{
+  color:var(--accent);flex:1;min-width:180px;word-break:break-all;
+  font:12.5px/1.5 var(--mono);
+  /* Underlined in the link's OWN colour. An underline painted in the hairline
+     seam reads at 1.4:1 — invisible — which would leave colour as the only
+     thing marking this as a link, and colour-alone is what WCAG 1.4.1 forbids. */
+  text-underline-offset:3px;
+}
+.sharelist a:hover{text-decoration-thickness:2px}
+.sharelist small{color:var(--muted)}
+/* The empty state reads as an empty slot, and its one next action (create a
+   link) is the button directly above it. */
+.sharelist li.muted{color:var(--muted);border:1px dashed var(--seam);padding:10px 12px}
+
+/* ---- text fields ---------------------------------------------------------- */
+/* One look for every text field wherever it appears; only the width differs.
+   This is a single rule on purpose: while the fields were styled per-container,
+   #sharepw fell through to the browser's own ~23px input while every control
+   around it was 36px — a squashed field in the share panel, under the touch
+   minimum, and invisible to any test that only looks at ids. */
+input[type=text],input[type=password],input[type=number]{
+  padding:8px 10px;border:1px solid var(--edge);border-radius:var(--r-ctl);
+  background:var(--surface);color:var(--fg);
+  font:14px/1.5 var(--sans);font-variant-numeric:tabular-nums;
+  min-height:var(--tap);min-width:0;
+}
+/* Fields that hold a URL, a path or a machine-generated credential read as data,
+   so they get the mono face — the readout rule applied the other way round. */
+.keybox input{flex:1;min-width:200px;font-family:var(--mono);font-size:12.5px}
+#lockbox input[type=password]{flex:1;min-width:220px}
+.row input[type=password],.row input[type=number]{flex:1;min-width:170px}
+
+/* ---- checkboxes ----------------------------------------------------------- */
+.chk{display:inline-flex;align-items:center;gap:7px;font-size:14px;min-height:var(--tap);cursor:pointer}
+.chk input{min-height:auto;width:16px;height:16px;accent-color:var(--accent)}
+
+@media (max-width:520px){
+  .bar{padding:10px 14px}
+  main{padding:14px 14px 26px;gap:12px}
+  .lockbox{padding:12px;border-radius:var(--r-panel)}
+  .sharelist li{border-radius:var(--r-panel)}
+}
+/* A coarse pointer gets the full 44px target. On a desktop the 36px control is
+   deliberate (this page is used with a terminal open beside it, and the extra
+   8px per control costs real vertical space in the editor); on a touch device
+   there is no precision to trade against, so the target grows. This is the same
+   split WCAG 2.2 SC 2.5.8 draws, taken to the AAA figure where it is free. */
+@media (pointer:coarse){
+  :root{--tap:44px}
+}
 </style>
 </head>
 <body
@@ -120,10 +297,10 @@ details.meta summary{cursor:pointer}
   data-has-password="{{.HasPassword}}"
   data-can-write="{{.CanWrite}}">
 
-<header>
-  <a class="brand" href="/">Relay <span>网络剪贴板</span></a>
+<header><div class="bar">
+  <h1 class="brandline"><a class="brand" href="/">Relay <span>网络剪贴板</span></a></h1>
   <span class="addr" id="addr">{{.DisplayURL}}</span>
-</header>
+</div></header>
 
 <main>
   <p class="hint" id="hint">{{.Hint}}</p>
@@ -135,7 +312,10 @@ details.meta summary{cursor:pointer}
         aria-label="{{.SecretLabel}}" placeholder="{{.SecretLabel}}">
       <button class="primary" id="unlock" type="button">解锁</button>
     </div>
-    <p class="status" id="lockstatus" role="status" aria-live="polite"></p>
+    <div class="statusline">
+      <span class="dot" aria-hidden="true"></span>
+      <p class="status" id="lockstatus" role="status" aria-live="polite"></p>
+    </div>
   </section>
 
   <div id="content"{{if .Locked}} hidden{{end}}>
@@ -151,7 +331,10 @@ details.meta summary{cursor:pointer}
       <button id="del" hidden>删除</button>
     </div>
 
-    <p class="status" id="status" role="status" aria-live="polite"></p>
+    <div class="statusline">
+      <span class="dot" aria-hidden="true"></span>
+      <p class="status" id="status" role="status" aria-live="polite"></p>
+    </div>
   </div>
 
   <details class="meta">
@@ -191,7 +374,10 @@ details.meta summary{cursor:pointer}
         aria-label="有效小时数" placeholder="有效小时（留空=默认）">
       <button id="createshare" type="button">创建分享链接</button>
     </div>
-    <p class="status" id="sharestatus" role="status" aria-live="polite"></p>
+    <div class="statusline">
+      <span class="dot" aria-hidden="true"></span>
+      <p class="status" id="sharestatus" role="status" aria-live="polite"></p>
+    </div>
     <div class="keybox" id="sharecodeout" hidden>
       <input type="text" id="sharecodevalue" readonly aria-label="取件码" placeholder="取件码">
       <button id="copycode" type="button">复制取件码</button>
@@ -285,6 +471,17 @@ details.meta summary{cursor:pointer}
     if (!el) return;
     el.textContent = msg || "";
     if (tone) el.setAttribute("data-tone", tone); else el.removeAttribute("data-tone");
+    // The lamp beside the words is the static half of the state: motion and
+    // colour are never the only channel, so a colourblind reader, a screen
+    // reader and a still screenshot all still see what happened. "Busy" is
+    // exactly "a message with no verdict attached yet", which is why it needs
+    // no separate bookkeeping at the call sites.
+    var line = el.parentNode;
+    if (line && line.classList && line.classList.contains("statusline")) {
+      if (tone) line.setAttribute("data-tone", tone);
+      else if (msg) line.setAttribute("data-tone", "busy");
+      else line.removeAttribute("data-tone");
+    }
   }
 
   function authHeaders(extra) {
@@ -643,8 +840,11 @@ details.meta summary{cursor:pointer}
       li.appendChild(a);
 
       var what = document.createElement("small");
-      what.textContent = (sh.has_code ? "6 位取件码" : (sh.has_password ? "分享密码" : "仅链接")) +
-        " · " + (sh.expires_text || "");
+      // Worded as a sentence rather than as "A · B · C": the middot-meta string
+      // is the shape every generated page reaches for, and it makes the reader
+      // work out which half is the credential and which is the deadline.
+      what.textContent = (sh.has_code ? "取件码" : (sh.has_password ? "分享密码" : "不需要口令")) +
+        "，有效期" + (sh.expires_text || "未知") + "。";
       li.appendChild(what);
 
       var copy = document.createElement("button");

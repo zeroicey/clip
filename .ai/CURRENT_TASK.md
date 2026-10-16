@@ -1,24 +1,115 @@
 # Current task
 
-**Status:** ✅ **步骤 ② 已上线并验证**；**下一步 = 美化 UI（已交接）** —— 定位 = **webnote.cc 的开源版本**。
-线上 = **`172ea54`**（干净工作区构建，可追溯）。步骤 ①（密码 + MIT LICENSE + 自动保存）与
-步骤 ②（只读分享链接 `/s/<token>`）都已上线。
-**更新：** 2026-10-16（第三会话）· **交接文档：** `.ai/sessions/2026-10-16-ui-beautification-handoff.md`
+**Status:** ⏳ **UI 大换皮：已实现、全部验证通过、人类已看过截图并批准提交/部署**。
+线上仍是 **`172ea54`**（步骤 ①② 已上线）。本轮只改了视觉层（未改任何 id、未改任何被断言的文案、未改行为）。
+**更新：** 2026-10-16（第四会话）· **设计决策：** `.ai/decisions/2026-10-16-ui-visual-direction.md`
 
-## 下一步：美化 UI（下一个会话）
+## 本轮：UI 大换皮（「工作台仪表」）
 
-用户指定：**下一个对话美化 UI**。先读
-`.ai/sessions/2026-10-16-ui-beautification-handoff.md` —— 它的「Do not repeat」一节
-是有用的东西（CSP 会挡内联 `style=`、别弄丢 `[hidden]` 规则、一个模板两种形态、
-被脚本钉住的 id/文案、textarea 的 `white-space:pre` 是刻意的）。
+**动过的文件只有两个**：`internal/clip/page.html`（`<style nonce>` + 少量标记）、
+`internal/clip/page.go`（`landingHTML`、`faviconSVG` 颜色）。
 
-要动的地方：`internal/clip/page.html`（`<style nonce>` L12–106 + 标记）与
-`internal/clip/page.go` 的 `landingHTML`（首页，L339+）。仓库里已有可直接用的技能：
-`.agents/skills/web-design-guidelines/`、`.agents/skills/accessibility-review/`。
+### 装了哪些技能（用户要求：先调研、自己装、再用）
 
-**完成定义不变**：`scripts/check.sh` 全绿 + 真库 `scripts/test-pg.sh` +
-**真浏览器**（`node scripts/verify-clip-browser.cjs`，本地 75/75 后部署、再打一次线上）+
-`git commit`/部署前先问人类。
+装在 **Pi 用户级** `~/.pi/agent/skills/`（**故意不入库** —— 这个仓库是纯 Go，不该塞 Node/Python 树），
+来源是 UI Skills 注册表 `https://www.ui-skills.com/skills/registry.json`，清单见
+`~/.pi/agent/skills/INSTALLED.md`：
+
+| skill | 来源 | 用途 |
+| --- | --- | --- |
+| `frontend-design` | anthropics/skills（官方） | 定视觉方向、反 AI 默认套路 |
+| `ui-ux-pro-max` | nextlevelbuilder | 设计情报（调色板/风格/UX 规则，Python + 数据） |
+| `better-ui` | jakubkrehel/skills | 抛光细节（同心圆角、阴影/边框、动效精确值） |
+| `baseline-ui` | ibelick/ui-skills | 去 slop（间距/层级/字型） |
+| `improve-ui` | ibelick/ui-skills | 审计既有界面 → 实施计划 |
+| `fixing-accessibility` | ibelick/ui-skills | WCAG/ARIA/焦点修复 |
+
+**注意**：Pi 只在启动时扫描技能目录，所以这 6 个**本轮没有出现在我的系统提示里** ——
+我是直接读 `SKILL.md` 内容并照着做的。下次会话 `/reload` 后它们会自动进入路由。
+
+### 设计系统（详见 decision）
+
+- **配色**：浅色 = 绘图纸（`#f2f4f4`），暗色 = 冷墨（`#0e1113`），**两套独立设计**，都走 `:root` 变量。
+- **两组灰不能互换**：`--seam` 只做分隔线（视觉性）；`--edge` 是**控件边界，实测 ≥3:1**（WCAG 1.4.11）。
+- **单一信号色**（青绿 `#0d6e69` / `#35c9c0`）承担「活着」语义；**琥珀只表示警告**；`--err` 只表示错误。
+- **等宽只给载荷与地址**（textarea、`#addr`、分享链接、取件码、`code`）；
+  **版本/过期这类读数用无衬线 + `tabular-nums`**。
+- **圆角同心**：`--r-ctl:8px` → `--r-panel:19px` → `--r-panel-lg:23px`（= 内 + padding + 边框）。
+- **唯一的「大胆之处」**：状态行左侧的状态灯（色 + 脉冲，脉冲只在 `prefers-reduced-motion:no-preference` 下跑）。
+- **触控**：桌面 36px（保既有密度），`@media (pointer:coarse)` 抬到 44px。
+- **焦点环**：`:where(a,button,input,textarea,summary,label.file):focus-visible` 一处声明，
+  `outline-offset:2px` 是承重的（否则主按钮上的环会消失进自己的强调色里）。
+
+### 本轮**没有**改的东西（这是刻意的）
+
+- **id 一个没动**（`body content hint lockbox lockstatus pw save setpw del sharebox sharecodeout
+  sharecodevalue sharelist sharestatus status` 全部原样）。
+- **被断言的中文串一个没动**（`已自动保存`/`已设密码`/`解锁中`/`公开`/`密码`/`频繁`/`已创建`/
+  `已撤销`/`失效`/`还没有`）。
+- **`data-state` / `data-can-write` / `writable = !isShare;` 全未动**；`verify-clip-browser.cjs` **无需修改**。
+- **`[hidden]` 规则改成 `[hidden]{display:none!important}`**（比原来更牢，不是更松）。
+- **`white-space:pre` 保留**（移动端 textarea 横向滚动是预期行为，不是溢出）。
+
+### 顺手修掉的（都是真问题，不是风格）
+
+1. **`#sharepw` 一直是浏览器默认的 ~23px 输入框** —— 分享面板里所有控件都是 36px，
+   只有它被漏掉（旧 CSS 只给 `.keybox input` 和 `#lockbox input[type=password]` 写了规则，
+   `.row` 里的 `#sharepw` 谁都没管）。现在文本输入框是**一条规则**，按容器只调宽度。
+   这个缺陷**任何只查 id 的测试都抓不到**，是本轮 DOM 几何审计抓出来的。
+2. **分享列表链接的下划线画在 `--seam` 上（1.4:1，等于看不见）** —— 只剩颜色区分链接，
+   违反 WCAG 1.4.1。改为用 `currentColor` 画（6.08:1）。
+3. **`button` 没有显式的 `:focus-visible`** —— 一直吃浏览器默认环（各家引擎不同色不同粗细），
+   与设计不一致。现在全站一处声明。
+4. **`details` 里的 `code` 被 `.92em` 缩到约 12px** —— 那是要读者照抄的 `curl` 一行命令。
+   面板内改为 `1em`。
+5. **剪贴板页原本没有 `<h1>`** —— 品牌名包进 `<h1 class="brandline">`，给屏幕阅读器一个落点。
+
+### 验证（全部实跑，不是推断）
+
+| 项 | 结果 |
+| --- | --- |
+| `scripts/check.sh` | ✅ 全绿（gofmt + vet + `sqlc diff` 无漂移 + `go test`） |
+| 真库 `scripts/test-pg.sh -count=1` | ✅ 全绿 |
+| 真浏览器 `verify-clip-browser.cjs` 打本机 | ✅ **75/75**，含 **0 CSP violation / 0 console error** |
+| **本机 DOM 实测对比度**（自写探针） | ✅ 4 个页面状态 × 明暗 = **106 组文本/底色对，0 失败**（逐元素算有效底色，不是只查 token） |
+| **Tab 顺序 + 焦点环**（真实按键，非 `el.focus()`） | ✅ 每态 3–11 站，顺序合理（品牌 → 正文 → 主操作 → 次操作 → 折叠区），**焦点环全部画出** |
+| DOM 几何审计 | ✅ 无页面级横向溢出；无文字被裁；唯一的「小目标」是 checkbox（其**包裹 label 是 36px**，误报） |
+| 截图 | `bin/e2e/uifinal/`（gitignore）与 `/tmp/ui-shots/`：landing / 编辑器（空·有内容）/ 锁定 / 分享 × 明暗 × 桌面+390px，共 26 张 |
+
+**关键取证（本机 8797，真库 `relay_test`）**：
+
+```bash
+go build -o /tmp/relayui3 ./cmd/clip
+DATABASE_URL="postgres://relay:$PW@127.0.0.1:5432/relay_test?sslmode=disable" \
+  PUBLIC_BASE_URL=http://127.0.0.1:8797 LISTEN_ADDR=127.0.0.1:8797 ENVIRONMENT=production \
+  setsid nohup /tmp/relayui3 > /tmp/relayui3.log 2>&1 < /dev/null &
+node scripts/verify-clip-browser.cjs http://127.0.0.1:8797   # 75/75
+```
+
+（**注意**：`127.0.0.1:8799` 被隔壁 teleport 的进程占着 —— 换 8797。）
+
+### ⚠️ 未做 / 需要人类动作
+
+1. ✅ **人眼已看截图并裁决「Looks good as-is」**（2026-10-16，用户原话）。
+   先前的局限如实记录：本会话可用模型**没有视觉能力**（`read` 图片被丢弃；openrouter 额度不足、
+   cheaperai 的视觉端点上游 404），所以派出的视觉审查子代理只能做 ImageMagick 像素采样 + 静态分析
+   （它自己也标注了这点）。因此**视觉方向的人工确认发生在数学/几何证据之外**，且是必须的一步 ——
+   已做。子代理提的 4 条建议里我采纳 3 条，驳回 1 条：它说主按钮的强调色焦点环不可见，
+   **判错了** —— `outline-offset:2px` 让环对着页面底色测量（5.51:1），而它建议的改法
+   （换成 on-accent 色）反而会降到 1.05:1。
+2. ✅ **已问过人类并获批准**：commit 本换皮（**不动**锁定页那个既有缺陷）→ 再构建/部署/线上验证。
+3. ⏳ **部署后**必须拿同一份脚本**再打一次线上**（本机绿 ≠ 线上绿）。
+4. **既有缺陷（不是本轮引入，未修 —— 用户裁决留作后续）**：锁定态下 `<details class="meta">` 仍渲染
+   「新密码 / 设置 / 去掉密码」—— 此刻点任何一个都必然 401。修它要动 `paint()` 状态机
+   （锁定/解锁转换），而那个区域是本仓库陷阱最密集的地方，故本轮不动，只记录。
+5. `pg_restore` 恢复演练仍未做（最大运维缺口）。
+
+---
+
+## 上一轮：步骤 ②（只读分享链接）已上线并验证
+
+定位 = **webnote.cc 的开源版本**。线上 = **`172ea54`**（干净工作区构建，可追溯）。
+步骤 ①（密码 + MIT LICENSE + 自动保存）与步骤 ②（只读分享链接 `/s/<token>`）都已上线。
 
 ### 步骤 ② 部署后的线上验证（都是实跑）
 

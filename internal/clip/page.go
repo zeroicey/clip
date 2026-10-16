@@ -336,50 +336,105 @@ func humanBytes(n int64) string {
 // is a suffix: someone told "put it on clip.hcyj.xyz" should find out what that
 // means without being told separately. It is a constant rather than a template
 // because it interpolates nothing.
+//
+// Same instrument vocabulary as the clipboard page (see the note in page.html):
+// hairline seams, one signal colour, a real 3:1 boundary on the input, and the
+// input itself as the hero — the most characteristic thing in this product's
+// world is "name a板 and go". Token values are duplicated rather than shared
+// because this page is a compile-time string with no template to include.
 const landingHTML = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
 <title>Relay 网络剪贴板</title>
 <style>
-:root{--bg:#f6f7f9;--fg:#14161a;--muted:#5c6470;--line:#d8dce3;--card:#fff;--accent:#1f6feb;--accent-fg:#fff}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e8eaee;--muted:#9aa3b0;--line:#272c34;--card:#161a20;--accent:#4c8dff;--accent-fg:#0b0d10}}
+:root{
+  color-scheme:light dark;
+  --bg:#f2f4f4;--surface:#fff;--surface-2:#eaeeef;--seam:#d3dadd;--edge:#77868b;
+  --fg:#12181a;--muted:#5c686c;--accent:#0d6e69;--accent-hover:#0a5a56;--on-accent:#fff;
+  --warn:#8a5a12;--err:#b3261e;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,"JetBrains Mono",monospace;
+  --r-ctl:8px;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0e1113;--surface:#171b1e;--surface-2:#20272b;--seam:#333b40;--edge:#68747a;
+    --fg:#e6e9e9;--muted:#8d989c;--accent:#35c9c0;--accent-hover:#4ad6cd;--on-accent:#06201f;
+    --warn:#e0a24a;--err:#ff6b5e}
+}
 *{box-sizing:border-box}
-body{margin:0;min-height:100%;background:var(--bg);color:var(--fg);
-  font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
-  display:flex;justify-content:center;padding:8vh 20px}
-main{max-width:620px;width:100%}
-h1{font-size:22px;margin:0 0 6px}
-p{color:var(--muted)}
-code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;
-  background:var(--card);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
-ol{padding-left:20px}
-li{margin:6px 0}
-form{display:flex;gap:10px;flex-wrap:wrap;margin:22px 0}
-input{flex:1;min-width:200px;padding:11px 13px;border:1px solid var(--line);border-radius:9px;
-  background:var(--card);color:var(--fg);font:inherit}
-button{appearance:none;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);
-  border-radius:9px;padding:11px 18px;font:inherit;font-weight:600;cursor:pointer;min-height:44px}
-small{color:var(--muted)}
+[hidden]{display:none!important}
+body{margin:0;min-height:100vh;min-height:100dvh;background:var(--bg);color:var(--fg);
+  font:16px/1.65 var(--sans);display:flex;flex-direction:column;
+  -webkit-tap-highlight-color:transparent}
+::selection{background:var(--accent);color:var(--on-accent)}
+header{background:var(--surface);border-bottom:1px solid var(--seam)}
+.bar{max-width:1000px;margin:0 auto;padding:11px 20px;display:flex;align-items:center;gap:10px}
+.brand{font-weight:600;text-decoration:none;color:inherit}
+.brand span{color:var(--muted);font-weight:400;font-size:13px;margin-left:7px}
+main{flex:1;width:100%;max-width:1000px;margin:0 auto;padding:clamp(28px,6vh,64px) 20px 40px;
+  display:grid;gap:clamp(28px,4vw,52px);align-content:start;
+  grid-template-columns:minmax(0,1fr)}
+h1{font-size:clamp(26px,4.4vw,36px);line-height:1.25;letter-spacing:-.01em;margin:0 0 14px;
+  max-width:15ch;text-wrap:balance}
+.lede{color:var(--muted);margin:0 0 26px;max-width:44ch;text-wrap:pretty}
+form{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 12px}
+input{flex:1;min-width:190px;padding:12px 14px;border:1px solid var(--edge);border-radius:var(--r-ctl);
+  background:var(--surface);color:var(--fg);font:inherit;min-height:46px;caret-color:var(--accent)}
+input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button{appearance:none;border:1px solid var(--accent);background:var(--accent);color:var(--on-accent);
+  border-radius:var(--r-ctl);padding:12px 22px;font:inherit;font-weight:600;cursor:pointer;
+  min-height:46px;transition-property:background-color,border-color,transform;
+  transition-duration:150ms;transition-timing-function:ease-out}
+@media (hover:hover){button:hover{background:var(--accent-hover);border-color:var(--accent-hover)}}
+@media (prefers-reduced-motion:no-preference){button:active{transform:scale(.96)}}
+.hint{margin:0;color:var(--muted);font-size:13.5px}
+.hint code{color:var(--fg)}
+code,kbd{font-family:var(--mono);font-size:.9em;background:var(--surface-2);
+  border:1px solid var(--seam);border-radius:6px;padding:1px 6px}
+h2{font-size:13px;font-weight:600;color:var(--muted);margin:0 0 4px}
+ol{padding-left:22px;margin:0}
+li{margin:9px 0;max-width:46ch}
+.facts{margin:22px 0 0;padding-top:16px;border-top:1px solid var(--seam);font-size:13.5px;color:var(--muted)}
+.facts li{margin:6px 0}
+.facts b{color:var(--warn);font-weight:600}
+@media (min-width:880px){
+  main{grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);align-items:start}
+  .lede{max-width:42ch}
+}
 </style>
 </head>
 <body>
+<header><div class="bar"><a class="brand" href="/">Relay <span>网络剪贴板</span></a></div></header>
 <main>
-<h1>Relay 网络剪贴板</h1>
-<p>把一个后缀当成一块公共写字板：在一台机器上写，在另一台机器上打开同一个网址就能读到。</p>
-<form action="/" method="get" onsubmit="return false">
-  <input id="sfx" name="s" placeholder="随便打几个字符，比如 ops1" aria-label="后缀" autocapitalize="off" autocomplete="off" spellcheck="false">
-  <button id="go" type="button">打开</button>
-</form>
-<ol>
-  <li>在上面输入几个字符（只能用 <code>a-z 0-9 - _</code>），点「打开」。</li>
-  <li>写出你要搬过去的内容，点「保存」。这个后缀就是你的了 —— 浏览器会替你记住写权限。</li>
-  <li>在另一台机器上打开同一个网址，全选复制即可。想用命令行：<code>curl &lt;网址&gt;/raw</code>。</li>
-</ol>
-<p><small>后缀是公开的：知道后缀的人都能读。别往里放密码、密钥或任何机密。
-默认 24 小时后自动清空；图片单张上限 5 MiB，最多 4 张。</small></p>
+  <section>
+    <h1>网址就是剪贴板</h1>
+    <p class="lede">取一个后缀当网址，在一台机器上写下内容，在另一台机器上打开同一个网址就能读到 —— 不用登录，也不用传文件。</p>
+    <form action="/" method="get" onsubmit="return false">
+      <input id="sfx" name="s" placeholder="ops1" aria-label="后缀" autocapitalize="off" autocomplete="off" spellcheck="false">
+      <button id="go" type="button">打开</button>
+    </form>
+    <p class="hint">后缀只能用 <code>a-z 0-9 - _</code>。留空就用占位符里那个随机的。</p>
+  </section>
+  <section>
+    <h2>三步</h2>
+    <ol>
+      <li>取一个后缀，点「打开」。这个后缀从此就是你的网址，浏览器会替你记住它。</li>
+      <li>写下要搬过去的内容 —— 停手就会自动保存。</li>
+      <li>在另一台机器打开同一个网址，全选复制即可。命令行直接 <code>curl &lt;网址&gt;/raw</code>。</li>
+    </ol>
+    <ul class="facts">
+      <li>默认保存 <b>24 小时</b>，到期自动清空。</li>
+      <li>图片单张上限 <b>5 MiB</b>，最多 4 张。</li>
+      <li>里面别放密码、密钥或任何机密 —— 没设密码时，知道网址的人<b>都能读、也都能改</b>。</li>
+      <li>要独占就给它<b>设一个密码</b>；只想给人看就创建一条<b>只读分享链接</b>，口令独立于主密码。</li>
+    </ul>
+  </section>
+</main>
 <script>
 (function(){
   var input=document.getElementById("sfx"),go=document.getElementById("go");
@@ -398,7 +453,6 @@ small{color:var(--muted)}
   }
 })();
 </script>
-</main>
 </body>
 </html>
 `
@@ -440,7 +494,9 @@ func renderLanding(w http.ResponseWriter) {
 // guessable, so an indexed suffix is a published one.
 const robotsTXT = "User-agent: *\nDisallow: /\n"
 
-// faviconSVG is inline so the service needs no static file pipeline at all.
+// faviconSVG is inline so the service needs no static file pipeline at all. Its
+// fill is the light-mode accent: a favicon sits on browser chrome we do not
+// control, and the deeper teal stays legible on both a light and a dark tab.
 const faviconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">` +
-	`<rect width="32" height="32" rx="7" fill="#1f6feb"/>` +
+	`<rect width="32" height="32" rx="7" fill="#0d6e69"/>` +
 	`<path d="M9 11h14M9 16h14M9 21h9" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg>`
