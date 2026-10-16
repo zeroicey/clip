@@ -34,14 +34,16 @@ clip 是一个**网络剪贴板**：`https://clip.hcyj.xyz/<后缀>` 打开一�
 | --- | --- |
 | `cmd/clip/main.go` | 进程入口、信号、`migrate`/`sweep`/`version` 子命令、janitor goroutine |
 | `internal/clip/config.go` | 环境变量解析与校验（`DATABASE_URL`、限额、kill switch） |
-| `internal/clip/suffix.go` | 后缀语法与保留字（`s`/`k` 已为分享路由预留） |
+| `internal/clip/suffix.go` | 后缀语法与保留字（`s`/`k` 已为分享路由预留，步骤 ② 已用上 `s`） |
 | `internal/clip/password.go` | argon2id 的哈希与 PHC 解析（`Blocked`/`verifyPassword`）、密码长度约束 |
-| `internal/clip/store.go` | 连接池、迁移、全部存储语义（密码校验的证明、过期、配额、资产） |
-| `internal/clip/queries/clips.sql` + `clipdb/` | sqlc 输入与生成物 |
-| `internal/clip/api.go` | Gin 路由、封套、JSON/multipart 写入、公共路径分发 |
+| `internal/clip/share.go` | 只读分享：22 字符 base64url token、6 位取件码、`Share` 类型与分享的存储方法 |
+| `internal/clip/store.go` | 连接池、迁移、全部存储语义（密码校验的证明、过期、配额、资产、接管清分享） |
+| `internal/clip/queries/*.sql` + `clipdb/` | sqlc 输入与生成物（`clips.sql` + `shares.sql`） |
+| `internal/clip/api.go` | Gin 路由、封套、JSON/multipart 写入、公共路径分发（含 `/s/...` 转发） |
+| `internal/clip/api_shares.go` | 分享的主入口（`/api/clips/:suffix/shares`）与访客读侧（`/s/...`、`/api/shares/:token`） |
 | `internal/clip/page.go` + `page.html` | 服务端渲染页面、CSP/nonce、落地页、robots/favicon |
 | `internal/clip/hub.go` | 进程内 long-poll hub（按后缀的唤醒） |
-| `internal/ratelimit/` | 固定窗口限流：按 IP 的写限流 + 按（地址/后缀）的**解锁失败**限流 |
+| `internal/ratelimit/` | 固定窗口限流：按 IP 的写限流 + 按（地址/后缀/分享 token）的**口令失败**限流 |
 | `internal/clientip/` | 客户端 IP 判定（限流键）—— 从 teleport 抽出，规则与回归测试一并带过来 |
 | `scripts/` | `check.sh`（闸门）、`build.sh`、`check-sqlc-sync.sh`、`test-pg.sh` |
 | `bin/e2e/` | 真实浏览器验证脚本（不进 git） |
@@ -79,6 +81,10 @@ clip 是一个**网络剪贴板**：`https://clip.hcyj.xyz/<后缀>` 打开一�
    401，页面必须据此切到解锁壳而不是继续显示旧内容 —— 见 pitfalls）。落后的调用者**立即**返回。
 4. **图片**：`POST /api/clips/{suffix}/assets`（multipart，同一套密码）整体替换，
    位置即地址（`/raw/{n}`）；类型从字节嗅探。
+5. **分享（只读的第二入口）**：`POST /api/clips/{suffix}/shares`（需主密码）创建一条
+   `clip_shares` 行 → 访客走 `/s/<token>`（**只挂 GET/HEAD**）。分享口令**独立于主密码**，
+   读侧不套 clip 自己的密码闸门；不复制内容（指同一行，主人改了分享方即见）；
+   撤销 = 删行，`on delete cascade` 跟 clip 一起消失。拓扑：`.ai/decisions/2026-10-16-clip-share-links.md`。
 
 ## 5. 不变量
 
@@ -99,10 +105,19 @@ clip 是一个**网络剪贴板**：`https://clip.hcyj.xyz/<后缀>` 打开一�
 1d. **设密码就是所有权声明**（无密码的行谁都能设，这就是「先设先得」）；接管过期后缀
    时密码不随行——新持有人拿到的是公开 clip。**Guarded**：`TestSetPasswordClaimsAPublicClip`、
    `TestExpiredSuffixBecomesReusable`。
+1e. **分享入口天生只读、口令独立于主密码**：`/s/...` 只挂 GET/HEAD（写形状 → 405）；
+   读 `/s/...` **不**套 clip 的密码闸门（主密码也打不开一条另设密码的分享）；
+   上锁的分享页不渲正文、**不回显后缀**。漏掉任何一个读入口，分享口令就只是装饰。
+   **Guarded**：`TestEveryShareReadPathIsBehindTheShareSecret`、`TestShareEntranceHasNoWriteShape`、
+   `TestSharePageNeverRevealsTheOwnerSAddress`；真浏览器打线上的 75/75。
+   分享口令的猜测复用同一个 limiter，桶键 `ip:`/`share:<token>`（取件码 10^6 空间靠
+   短 TTL + 每 token 预算）。
 2. **过期的后缀可被接管**：`ClaimSuffix` 的 `DO UPDATE` 只在 `expires_at <= now` 时命中。
    否则一个刚过期、janitor 还没删的行会永久占住这个后缀。**Guarded**：`TestExpiredSuffixBecomesReusable`。
 3. **接管必须清掉前一位所有者的图片**（接管是 UPDATE，`ON DELETE CASCADE` 不会触发）。
    **Guarded**：`TestTakeoverClearsTheOldOwnersImages`。
+3b. **接管同样必须清掉前一位所有者的分享**（同一个坑的另一面）：不清的话，旧主人的
+   读链接会继续指向**新主人**的内容 —— 比死链更糟。**Guarded**：`TestTakeoverDropsTheOldOwnersShares`。
 4. **`rev` 每次成功的写入都递增**，即使内容一模一样 —— 读者等的是这个数。
    **Guarded**：`TestRevChangesEvenWhenTheBodyDoesNot`。
 5. **配额在事务里、advisory lock 之后检查**（读总量→比较→插入三步并发下会一起通过）。
