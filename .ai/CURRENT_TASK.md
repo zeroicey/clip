@@ -18,6 +18,11 @@
 
 **顺序（用户选的）**：① 密码（含 MIT LICENSE + 自动保存）→ 上线验证 → ② 分享链接。
 
+**本会话在这里结束：设计已锁、代码未写。** 从
+`.ai/sessions/2026-10-16-password-and-ownership-handoff.md` 接着做（里面记了
+两个实现时会撞上的坑：argon2 进不了 SQL 的原子性写法、以及带密码后「不泄漏后缀是否存在」
+这条性质要让位）。“下一会话先做 ①-a：`migrations/0002_*.sql`”。
+
 **Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-clip-split-and-launch-handoff.md`
 
 teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.md` 开始读。
