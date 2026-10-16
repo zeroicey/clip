@@ -1,14 +1,45 @@
 # Current task
 
-**Status:** 步驟 ② **已实现、已在本地全部验证**，**等人类批准后提交 + 部署** ——
-定位 = **webnote.cc 的开源版本**。
-步骤 ①（密码 + MIT LICENSE + 自动保存）已上线（线上 `9126d5c`）。
-步骤 ②（只读分享链接 `/s/<token>`）代码写完：真库 **21 条分享测试**（+ 原有全部）、
-真浏览器 **74/74 连跑 3 次全绿**、`scripts/check.sh` 全绿、`sqlc diff` 无漂移。
-**下一步 = `git commit`（问过人类）→ 按 `.ai/runbooks/deploy-clip.md` 部署 → 线上验证。**
+**Status:** ✅ **步骤 ② 已上线并验证** —— 定位 = **webnote.cc 的开源版本**。
+线上 = **`172ea54`**（干净工作区构建，可追溯）。
+步骤 ①（密码 + MIT LICENSE + 自动保存）与步骤 ②（只读分享链接 `/s/<token>`）都已上线。
+**下一步 = 未排期**（见下方「未做」：`pg_restore` 恢复演练仍最大缺口）。
 **Updated:** 2026-10-16（第三会话）
 
-### 部署后的线上验证（都是实跑）
+### 步骤 ② 部署后的线上验证（都是实跑）
+
+- 迁移已应用：`schema_migrations` = `0001` + `0002` + **`0003`**；`relay` 库里
+  `clip_shares` 已存在（PK、`suffix` 索引、部分 `expires_at` 索引、
+  `suffix → clips ON DELETE CASCADE`）。
+- **runbook (a)-(d)**：本机 loopback 200；hcyj `curl 172.17.0.1:8790` = 200；
+  caddy 容器 `wget` 可过；`HEAD https://clip.hcyj.xyz/api/health` = **200**；
+  契约形状：`/api/nope` = JSON、`/a/b/c` = text/plain、`/neversuch` = 200、
+  `robots.txt` = 200、`POST /ops1` = 405、`POST /s/<token>` = **405**、
+  `/s/<未知 token>` = **404**。
+- **runbook (e)+(f) 产品码 33/33**（`/tmp/verify-shares-prod.cjs`）：密码那套 9 项全绿；
+  分享那套 24 项全绿 —— 包含**分享口令能开、主密码打不开**、锁壳不含正文、
+  不回显后缀、`POST/PUT /s/...` = 405、撤销后立即 404、取件码 6 位且正确码可开/
+  错误码 401、列表不回显取件码、删 clip 后分享一起死。
+- **真浏览器 75/75 连跑 2 次全绿**（打线上 `https://clip.hcyj.xyz`）。
+- 大陆观测点 hcyj / koma：`HEAD=200 verify=0`，`/s/<未知>` = 404。
+- 冷备：`/data/backups/clip-20261016-172707.dump`（`pg_restore -l` 可读，15 TOC 项，`dbname: relay`）。
+
+### 部署时抓到并修掉的真问题（都是部署后才暴露的）
+
+本地真浏览器 3 次全绿，**打线上第一次就红**：`the share link has the /s/<token> shape`
+→ `Cannot navigate to invalid URL`。不是产品缺陷，是**脚本与页面的时序竞速**：
+页面先写“已创建”状态、再异步刷新列表，而脚本看到状态文本就立即读 `#sharelist a`。
+线上 RTT ~100ms → `href` 还是空 → `Page.navigate("")` 报 invalid URL。
+修法：页面 `await loadShares()` 再报成功（同时也是 UX 修复），脚本改成
+等锚点出现。提交 `172ea54`，线上 75/75×2。详见
+`.ai/pitfalls/cases/2026-10-16-share-page-unlocked-into-an-editor.md` 的「同族」一节。
+
+**注（刻意为之）**：生产 `clip.env` **没有**显式写 `CLIP_UNLOCK_PER_HOUR` /
+`CLIP_SHARE_CODE_TTL`，它们用代码默认值（口令猜测预算 20 次失败/小时/桶、
+取件码有效期上界 30 分钟）。`deploy/clip.env.example` 已把两个变量写进去并注明含义；
+改它们时记得 `systemctl restart clip`。
+
+### 步骤 ① 部署后的线上验证（都是实跑，当时线上 `9126d5c`）
 
 - 三条连通性检查：a) HEAD 200、b) `verify=0 http=200`、c) 隧道 200。
 - 密码那套（线上真跑）：无口令 `/raw` 401 且不泄正文、带口令 200、页面是锁态、
@@ -29,9 +60,9 @@
 只有最新一次能改状态。详见 `.ai/pitfalls/cases/2026-10-16-overlapping-unlock-attempts.md`。
 
 另一个自测陷阱：`CLIP_WRITE_PER_HOUR=30` 是**按源地址、所有后缀一个桶**，
-而验证脚本一次跑约 7 次写 —— 一小时内跑四次以上就把自己限了，
-并伪装成无关的功能故障。脚本现在会识别并以退出码 3 说明；
-限流器是进程内的，`systemctl restart clip` 即清空。见 runbook。
+而验证脚本现在一次跑约 **10** 次写（步骤 ② 又加了两次「建分享」）—— 一小时内跑三次以上
+就把自己限了，并伪装成无关的功能故障。脚本会识别并以退出码 3 说明；
+限流器是进程内的，`systemctl restart clip` 即清空。（本次部署就每轮前重启一次。）
 
 ## 步骤 ① 落地了什么（密码 / 归属 / 自动保存 / LICENSE）
 
@@ -89,10 +120,10 @@
 
 **未做 / 待办**：
 
-- [ ] **提交 + 部署 + 线上验证**（等人类批准；runbook 已加 (f) 分享那套验证）。
-- [ ] 线上 `CLIP_SHARE_CODE_TTL` / `CLIP_UNLOCK_PER_HOUR` 写进 `/data/services/clip/clip.env`
-      （模板已补，不写则用默认值）。
+- [x] **提交 + 部署 + 线上验证** ✅（`9872d16` + `172ea54`，线上 75/75×2）。
+- [x] 真库/真浏览器/runbook (e)(f)/大陆观测点 全绿。
 - [ ] `pg_restore` 恢复演练仍未做（仍是最大运维缺口）。
+- [ ] 生产 `clip.env` 里显式写 `CLIP_UNLOCK_PER_HOUR` / `CLIP_SHARE_CODE_TTL`（可选，现用默认值）。
 
 ---
 
