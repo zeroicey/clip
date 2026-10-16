@@ -16,7 +16,8 @@
   契约形状：`/api/nope` = JSON、`/a/b/c` = text/plain、`/neversuch` = 200、
   `robots.txt` = 200、`POST /ops1` = 405、`POST /s/<token>` = **405**、
   `/s/<未知 token>` = **404**。
-- **runbook (e)+(f) 产品码 33/33**（`/tmp/verify-shares-prod.cjs`）：密码那套 9 项全绿；
+- **runbook (e)+(f) 产品码 33/33**（当时用一个临时 Node 脚本逐项断言，
+  runbook (e)/(f) 里的 curl 命令就是它的等价体）：密码那套 9 项全绿；
   分享那套 24 项全绿 —— 包含**分享口令能开、主密码打不开**、锁壳不含正文、
   不回显后缀、`POST/PUT /s/...` = 405、撤销后立即 404、取件码 6 位且正确码可开/
   错误码 401、列表不回显取件码、删 clip 后分享一起死。
