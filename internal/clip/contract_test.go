@@ -222,9 +222,15 @@ func TestHeadMirrorsGetOnEveryRoute(t *testing.T) {
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
+	// A live share, so the share routes are success paths here too and the
+	// HEAD/GET comparison is not made vacuously by two identical 404s.
+	shareToken, _ := createShare(t, r, "ops1", "", map[string]any{})
+
 	for _, path := range []string{
 		"/", "/robots.txt", "/favicon.ico", "/favicon.svg",
 		"/ops1", "/ops1/raw", "/brandnew", "/api/health", "/api/nope",
+		"/s/" + shareToken, "/s/" + shareToken + "/raw", "/s/" + shareToken + "/raw/0",
+		"/api/shares/" + shareToken,
 	} {
 		get := fetch(t, srv, "GET", path)
 		getBody := readBody(t, get)
@@ -289,6 +295,83 @@ func TestPublicPathsOnlyAnswerReadMethods(t *testing.T) {
 	}
 	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Errorf("POST /api/nope answered %q, want JSON", ct)
+	}
+}
+
+// TestShareWireContract pins the share payload's field names and the page
+// plumbing that consumes them.
+//
+// It exists for the same reason TestClientReadsTheFieldNamesTheServerWrites does:
+// the page's JS is not type-checked against the Go structs, so a rename on either
+// side is silent. A share page that stopped reading `api_base` would fetch the
+// clip namespace with a share token and 404 with no error anywhere.
+func TestShareWireContract(t *testing.T) {
+	d := shareData{
+		Token:       "tok",
+		URL:         "https://clip.example/s/tok",
+		RawURL:      "https://clip.example/s/tok/raw",
+		Exists:      true,
+		Rev:         2,
+		Assets:      []assetData{},
+		ExpiresText: "明天",
+		HasPassword: true,
+		HasCode:     false,
+	}
+	encoded, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		`"token"`, `"url"`, `"raw_url"`, `"has_password"`, `"has_code"`,
+		`"exists"`, `"rev"`, `"expires_at"`, `"expires_text"`,
+	} {
+		if !bytes.Contains(encoded, []byte(key)) {
+			t.Errorf("the server does not emit %s; the client reads it", key)
+		}
+	}
+	// Camel-case spellings must not appear in a response.
+	for _, wrong := range []string{`"hasPassword"`, `"hasCode"`, `"rawUrl"`} {
+		if bytes.Contains(encoded, []byte(wrong)) {
+			t.Errorf("share response contains %s; responses are snake_case", wrong)
+		}
+	}
+	// The suffix must never be part of a share payload: /s/<token> is supposed to
+	// be usable without disclosing (or helping enumerate) the owner's address.
+	if bytes.Contains(encoded, []byte(`"suffix"`)) {
+		t.Error("the share payload exposes a suffix field")
+	}
+	// The stored hash must never be part of it either.
+	if bytes.Contains(encoded, []byte("argon2id")) {
+		t.Error("the share payload carries a stored hash")
+	}
+
+	page, err := pageFS.ReadFile("page.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(page)
+	// The attributes the server sets for both shapes, and the endpoints the page
+	// has to call through them.
+	for _, needle := range []string{"dataset.share", "dataset.apiBase", "dataset.rawBase", "dataset.token"} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("page.html never reads %s", needle)
+		}
+	}
+	if !strings.Contains(js, `"/shares"`) {
+		t.Error("page.html never calls the share-management endpoint")
+	}
+	// The one-time pickup code must be surfaced, not silently dropped.
+	if !strings.Contains(js, "sharecodevalue") {
+		t.Error("page.html never shows the generated pickup code")
+	}
+	// A share must stay read-only after unlocking. The bug this pins: the unlock
+	// success path set `writable = true` unconditionally, so a visitor who typed the
+	// share secret got a full editor — a visible Save and Delete, an editable
+	// textarea — on a link that is meant to be read-only. The server refused every
+	// write (the routes do not exist), so the page was lying rather than unsafe; but
+	// a page whose controls contradict its own guarantees is a bug in this project.
+	if !strings.Contains(js, "writable = !isShare;") {
+		t.Error("page.html no longer keeps a share read-only after unlock (see verify-clip-browser.cjs)")
 	}
 }
 

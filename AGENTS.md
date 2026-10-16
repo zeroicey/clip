@@ -27,6 +27,8 @@ sqlc generate                    # 改过 internal/clip/queries/*.sql 之后（�
 | --- | --- |
 | `cmd/clip/main.go` | 入口：`serve`（默认）/ `migrate` / `sweep` / `version` |
 | `internal/clip/` | 这个服务的全部功能：配置、后缀规则、存储、API、页面、long-poll hub |
+| `internal/clip/share.go` | 只读分享链接：token/取件码生成、`Share` 类型、分享的读写语句 |
+| `internal/clip/api_shares.go` | 分享的主入口（`/api/clips/:suffix/shares`）与访客读侧（`/s/<token>`、`/api/shares/:token`） |
 | `internal/clip/migrations/` | 迁移 = schema 的**唯一真源**（sqlc 也读这里） |
 | `internal/clip/queries/` + `clipdb/` | sqlc 的输入与生成物（生成物入库，靠 `sqlc diff` 防漂移） |
 | `internal/clientip/` | 客户端 IP 判定（限流键）。从 teleport 抽出，规则与测试一并带过来 |
@@ -45,6 +47,12 @@ sqlc generate                    # 改过 internal/clip/queries/*.sql 之后（�
   **绝不退化成 read-then-write**（那正是要防的竞态）。
 - **密码挡全部 4 条读路径**：页面、`/<后缀>/raw`、`/<后缀>/raw/N`、`GET /api/clips/:suffix`。
   漏掉任何一条，密码就只是装饰。**上锁的页面绝不把正文渲进 HTML**（渲成壳，解锁后走 API 拉）。
+- **分享链接（`/s/<token>`）天生只读、口令独立**：`/s/...` 只挂 GET/HEAD（写形状 → 405）；
+  分享口令**不是**主密码 —— 读 `/s/...` 时不套 clip 自己的密码闸门（分歧二 → a）。
+  分享**不复制内容**（指同一份），撤销 = 删行，`on delete cascade` 跟 clip 一起消失；
+  **但接管（`ClaimSuffix` 的 DO UPDATE）不会触发 cascade，必须显式清 `clip_shares`**
+  （与 `clip_assets` 同一个坑，`store.go` 的 `Create` 里一起清）。上锁的分享页同样不渲正文，
+  且**不回显后缀**（`/s/<token>` 只认 token）。
 - **密码口令用 header（`X-Clip-Password`），绝不用 query string 或 URL 路径**——会进访问日志、
   浏览器历史与 Referer。解锁用 `POST /api/clips/:suffix/unlock`。
 - **忘密码不可恢复**：没有找回流程，只能等过期或换后缀。

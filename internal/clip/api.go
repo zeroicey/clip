@@ -140,6 +140,21 @@ func (s *Server) router() *gin.Engine {
 	r.PUT("/api/clips/:suffix/password", s.handleSetPassword)
 	r.DELETE("/api/clips/:suffix/password", s.handleClearPassword)
 
+	// Share management. These live behind the clip's own password because they
+	// grant access: creating a link that hands out read access is exactly as
+	// sensitive as handing out the master password, and revoking is the owner's
+	// way to take it back.
+	get("/api/clips/:suffix/shares", s.handleListShares)
+	r.POST("/api/clips/:suffix/shares", s.handleCreateShare)
+	r.DELETE("/api/clips/:suffix/shares/:token", s.handleDeleteShare)
+
+	// The visitor side of a share. It has its own JSON read (for the locked-shell
+	// page, which cannot send the header on the initial navigation) and its own
+	// unlock. Note there is no write endpoint anywhere under /api/shares: a share
+	// is read-only by construction, not by hiding buttons.
+	get("/api/shares/:token", s.handleGetShare)
+	r.POST("/api/shares/:token/unlock", s.handleUnlockShare)
+
 	r.NoRoute(s.handlePublicPath)
 	return r
 }
@@ -1031,6 +1046,17 @@ func (s *Server) handlePublicPath(c *gin.Context) {
 		return
 	}
 
+	// The share entrance. Dispatched before the clip-suffix shapes because `s` is a
+	// reserved suffix (see suffix.go) — no user can hold it — and because reaching
+	// here means the first segment was exactly "s", which no clip path can be.
+	//
+	// Only GET/HEAD arrive here (the method gate above), which is what makes a
+	// share read-only at the route layer rather than by convention.
+	if parts[0] == "s" {
+		s.serveShare(c, parts[1:])
+		return
+	}
+
 	switch len(parts) {
 	case 1:
 		s.serveClipPage(c, parts[0])
@@ -1051,6 +1077,35 @@ func (s *Server) handlePublicPath(c *gin.Context) {
 			return
 		}
 		s.serveRawAsset(c, parts[0], int16(n))
+	default:
+		notFoundPlain(c)
+	}
+}
+
+// serveShare dispatches the shapes under /s/: the page, its raw text and its
+// images. Anything else under /s/ is a 404 in the same text/plain shape, so a
+// visitor (or a script) parsing these routes never has to switch parsers.
+func (s *Server) serveShare(c *gin.Context, rest []string) {
+	switch len(rest) {
+	case 1:
+		s.serveSharePage(c, rest[0])
+	case 2:
+		if rest[1] != "raw" {
+			notFoundPlain(c)
+			return
+		}
+		s.serveShareRawText(c, rest[0])
+	case 3:
+		if rest[1] != "raw" {
+			notFoundPlain(c)
+			return
+		}
+		n, err := strconv.Atoi(rest[2])
+		if err != nil || n < 0 || n > 1<<15 {
+			notFoundPlain(c)
+			return
+		}
+		s.serveShareRawAsset(c, rest[0], int16(n))
 	default:
 		notFoundPlain(c)
 	}

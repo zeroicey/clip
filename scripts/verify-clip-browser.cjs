@@ -57,7 +57,7 @@ const check = (name, ok, detail = '') => {
 // spent hunting a phantom.
 const THROTTLE_HELP = [
   'being rate-limited (HTTP 429): the per-IP write budget is exhausted.',
-  '  Each run of this script costs ~7 writes; the default budget is 30/hour.',
+  '  Each run of this script costs ~10 writes; the default budget is 30/hour.',
   '  Wait for the window, or raise CLIP_WRITE_PER_HOUR on the instance under test.',
   '  Do not read the failures below as product bugs.',
 ].join('\n    ');
@@ -85,6 +85,7 @@ class Session {
     this.pending = new Map();
     this.console = [];
     this.failed = [];
+    this.dialogs = [];
     ws.onmessage = (ev) => {
       // A malformed or torn frame must not throw inside an event handler: the
       // exception would be swallowed by the event loop, the pending CDP call
@@ -109,6 +110,15 @@ class Session {
       // Console errors are how a CSP violation shows up: the page silently loses
       // its behaviour instead of failing loudly. That is exactly the class of
       // failure the earlier UI round shipped once, so it is asserted here.
+      if (m.method === 'Page.javascriptDialogOpening') {
+        // The page uses confirm() for destructive actions. A headless run has no
+        // user to answer, and an unanswered dialog blocks the renderer — which
+        // would present as a hung click rather than as a failed assertion. Accept
+        // it and record the message, so a test can still assert the confirmation
+        // was shown.
+        this.dialogs.push(m.params.message);
+        ws.send(JSON.stringify({ id: ++this.id, method: 'Page.handleJavaScriptDialog', params: { accept: true } }));
+      }
       if (m.method === 'Runtime.consoleAPICalled' && ['error', 'warning'].includes(m.params.type)) {
         this.console.push(m.params.args.map((a) => a.value ?? a.description ?? '').join(' '));
       }
@@ -441,6 +451,145 @@ async function main() {
     check('the image is served back with the password', imgStatus === 200, `status ${imgStatus}`);
     await writer.shot('clip-with-image.png');
 
+    // ---- share links: the read-only second entrance (/s/<token>) ------------
+    //
+    // The owner mints a share from their own page, a DIFFERENT browser opens it,
+    // and what that browser can do is the whole assertion: read, never write. A
+    // share that is merely "missing a button" would pass a DOM check and fail a
+    // real request, so the write attempts below go over HTTP as well.
+    const SHARE_PW = 'share-pw-77c1';
+    await writer.eval('(() => { document.getElementById("sharebox").open = true; return true; })()');
+    const panelOpen = await waitFor(writer, '!document.getElementById("sharebox").hidden');
+    check('the owner page offers a share panel once the clip is readable', panelOpen);
+    // Opening the panel loads the (empty) list; wait for that before creating, so
+    // the "created" assertion below cannot be satisfied by the wrong reload.
+    await waitFor(writer, 'document.getElementById("sharelist").textContent.includes("还没有")');
+
+    await writer.eval(`(() => {
+      document.getElementById('sharepw').value = ${JSON.stringify(SHARE_PW)};
+      document.getElementById('createshare').click();
+      return true;
+    })()`);
+    const shareCreated = await waitFor(writer,
+      'document.getElementById("sharestatus").textContent.includes("已创建")', 20000);
+    check('the owner can create a share link from the page', shareCreated,
+      await writer.eval('document.getElementById("sharestatus").textContent'));
+    failThrottled('POST shares', shareCreated ? 0 : 429);
+
+    const shareURL = await writer.eval('document.querySelector("#sharelist a")?.href || ""');
+    check('the share link has the /s/<token> shape', /\/s\/[A-Za-z0-9_-]{16,}$/.test(shareURL), shareURL);
+    const shareToken = shareURL.split('/s/')[1] || '';
+
+    // A fresh browser with no sessionStorage: this is what a colleague gets.
+    const sharer = await newPage(port);
+    await sharer.goto(shareURL);
+    check('a share renders in the locked state', (await sharer.eval('document.body.dataset.state')) === 'locked');
+    check('the locked share page has a secret input',
+      (await sharer.eval('!!document.getElementById("pw")')) === true);
+    const shareHtml = await sharer.eval('document.documentElement.outerHTML');
+    check('the locked share HTML does not contain the body', !shareHtml.includes('appended from machine A'));
+    check('the share page does not reveal the clip suffix', !shareHtml.includes(SFX));
+    check('the share page offers no share-management panel',
+      (await sharer.eval('!document.getElementById("sharebox")')) === true);
+    check('the share page cannot be mistaken for the editor',
+      (await sharer.eval('document.getElementById("save").hidden')) === true);
+
+    // Wrong secret, then the right one.
+    await sharer.eval(`(() => {
+      document.getElementById('pw').value = 'not-the-share-secret';
+      document.getElementById('unlock').click();
+      return true;
+    })()`);
+    await waitFor(sharer,
+      '(() => { const t = document.getElementById("lockstatus").textContent; return t.length > 0 && !t.includes("解锁中"); })()');
+    check('a wrong share secret is refused and reveals nothing',
+      (await sharer.eval('document.getElementById("content").hidden')) === true);
+
+    await sharer.eval(`(() => {
+      document.getElementById('pw').value = ${JSON.stringify(SHARE_PW)};
+      document.getElementById('unlock').click();
+      return true;
+    })()`);
+    const shareUnlocked = await waitFor(sharer,
+      'document.getElementById("body").value.includes("appended from machine A")');
+    check('the share secret reveals the content', shareUnlocked,
+      await sharer.eval('document.getElementById("lockstatus").textContent'));
+    check('the shared content is read-only in the visitor browser',
+      (await sharer.eval('document.getElementById("body").readOnly')) === true);
+    check('the share view offers no save button',
+      (await sharer.eval('document.getElementById("save").hidden')) === true);
+    check('the share view offers no delete button',
+      (await sharer.eval('document.getElementById("del").hidden')) === true);
+    check('the share view offers no password controls',
+      (await sharer.eval('!document.getElementById("setpw")')) === true);
+    await sharer.shot('clip-share-reader.png');
+
+    // The decisive read-only check: the write shapes have no route at all. A
+    // DOM-only assertion ("the button is hidden") would pass even if the endpoint
+    // existed and merely had no button pointing at it.
+    for (const method of ['PUT', 'POST', 'DELETE']) {
+      const w = await fetchJSON(`${BASE}/s/${shareToken}`, method, {
+        headers: { 'Content-Type': 'application/json', 'X-Clip-Password': SHARE_PW },
+        body: JSON.stringify({ body: 'defaced through the share' }),
+      });
+      check(`a share refuses ${method} with 405`, w.status === 405, `status ${w.status}`);
+    }
+    check('the attempted write did not reach the content',
+      (await fetchText(`${BASE}/s/${shareToken}/raw`, { 'X-Clip-Password': SHARE_PW }))
+        .includes('appended from machine A'));
+
+    // The share secret is INDEPENDENT of the master password — that is the whole
+    // reason the feature exists — so each must open exactly its own entrance.
+    check('the master password does not open the share',
+      (await fetchStatus(`${BASE}/s/${shareToken}/raw`, { 'X-Clip-Password': PW })) !== 200);
+    check('the share secret does not open the clip',
+      (await fetchStatus(`${BASE}/${SFX}/raw`, { 'X-Clip-Password': SHARE_PW })) !== 200);
+    check('the share secret opens the share /raw',
+      (await fetchStatus(`${BASE}/s/${shareToken}/raw`, { 'X-Clip-Password': SHARE_PW })) === 200);
+    check('the share /raw without the secret is refused',
+      (await fetchStatus(`${BASE}/s/${shareToken}/raw`)) !== 200);
+
+    // ---- revoking a share kills it immediately -----------------------------
+    await writer.eval(`(() => {
+      const b = [...document.querySelectorAll('#sharelist button')].find((x) => x.textContent === '撤销');
+      if (!b) return false;
+      b.click();
+      return true;
+    })()`);
+    const revoked = await waitFor(writer,
+      'document.getElementById("sharelist").textContent.includes("还没有")', 20000);
+    check('the owner can revoke a share from the page', revoked,
+      await writer.eval('document.getElementById("sharestatus").textContent'));
+    check('revoking asks for confirmation first', writer.dialogs.length > 0);
+    check('a revoked share is immediately dead',
+      (await fetchStatus(`${BASE}/s/${shareToken}/raw`, { 'X-Clip-Password': SHARE_PW })) === 404);
+    // And the visitor's open page notices, clearing content it may no longer show.
+    const shareDead = await waitFor(sharer,
+      'document.getElementById("hint").textContent.includes("失效")', 35000);
+    check('the visitor page notices the revocation', shareDead,
+      await sharer.eval('document.getElementById("hint").textContent'));
+    check('and clears the content it may no longer show',
+      (await sharer.eval('document.getElementById("body").value')) === '');
+
+    // ---- the pickup-code mode ----------------------------------------------
+    await writer.eval(`(() => {
+      document.getElementById('sharecode').checked = true;
+      document.getElementById('sharepw').value = '';
+      document.getElementById('createshare').click();
+      return true;
+    })()`);
+    const codeShown = await waitFor(writer,
+      'document.getElementById("sharecodeout").hidden === false', 20000);
+    const code = await writer.eval('document.getElementById("sharecodevalue").value');
+    check('a pickup-code share shows a 6-digit code', codeShown && /^[0-9]{6}$/.test(code), code);
+    const codeURL = await writer.eval('document.querySelector("#sharelist a")?.href || ""');
+    const codeToken = codeURL.split('/s/')[1] || '';
+    check('the pickup code opens the share',
+      (await fetchStatus(`${BASE}/s/${codeToken}/raw`, { 'X-Clip-Password': code })) === 200,
+      `status with code ${code}`);
+    check('a wrong pickup code does not open the share',
+      (await fetchStatus(`${BASE}/s/${codeToken}/raw`, { 'X-Clip-Password': '000000' })) !== 200);
+
     // ---- console hygiene ----------------------------------------------------
     // Two kinds of noise are expected, and each is paired below with an
     // assertion that it was the expected thing and was handled:
@@ -509,8 +658,8 @@ async function main() {
 // Two functions rather than one with a flag: the call sites read as what they
 // want ("the status" vs "the body"), and neither can be called with the wrong
 // mode by accident.
-async function fetchText(url) {
-  const res = await fetch(url, { redirect: 'manual' });
+async function fetchText(url, headers) {
+  const res = await fetch(url, { redirect: 'manual', headers: headers || {} });
   return await res.text();
 }
 

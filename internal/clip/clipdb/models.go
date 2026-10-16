@@ -27,3 +27,12 @@ type ClipAsset struct {
 	Content   []byte
 	CreatedAt int64
 }
+
+type ClipShare struct {
+	Token        string
+	Suffix       string
+	PasswordHash pgtype.Text
+	CodeHash     pgtype.Text
+	ExpiresAt    int64
+	CreatedAt    int64
+}

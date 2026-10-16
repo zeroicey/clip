@@ -88,13 +88,31 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"password":"deploy-chec
   https://clip.hcyj.xyz/api/clips/$SFX/unlock >/dev/null                                       # 解锁应 200
 curl -s -X DELETE -H 'X-Clip-Password: deploy-check-pw' https://clip.hcyj.xyz/api/clips/$SFX  # 清理（204）
 
-# f) 真库测试
+# f) 分享那套（改过分享/路由/页面时必须）—— 只读、口令独立、撤销即死：
+SSFX=deployshare$RANDOM
+curl -s -X PUT -H 'Content-Type: application/json' \
+  -d '{"body":"SHARED-BODY","password":"deploy-check-pw"}' https://clip.hcyj.xyz/api/clips/$SSFX >/dev/null
+# 主人（带主密码）建一条带分享口令的分享；从响应里取 token
+TOKEN=$(curl -s -X POST -H 'Content-Type: application/json' -H 'X-Clip-Password: deploy-check-pw' \
+  -d '{"password":"deploy-share-pw"}' https://clip.hcyj.xyz/api/clips/$SSFX/shares \
+  | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+curl -s -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/s/$TOKEN/raw                                  # 必须非 200
+curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Clip-Password: deploy-share-pw' https://clip.hcyj.xyz/s/$TOKEN/raw  # 必须 200
+curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Clip-Password: deploy-check-pw' https://clip.hcyj.xyz/s/$TOKEN/raw  # 必须非 200（主密码打不开分享）
+curl -s https://clip.hcyj.xyz/s/$TOKEN | grep -c 'SHARED-BODY'                                             # 必须 0（锁壳不渲正文）
+curl -s https://clip.hcyj.xyz/s/$TOKEN | grep -c "$SSFX"                                                  # 必须 0（不回显后缀）
+curl -s -X POST -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/s/$TOKEN                            # 必须 405（只读）
+curl -s -X DELETE -H 'X-Clip-Password: deploy-check-pw' https://clip.hcyj.xyz/api/clips/$SSFX/shares/$TOKEN # 撤销（204）
+curl -s -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/s/$TOKEN/raw                                # 必须 404（撤销即死）
+curl -s -X DELETE -H 'X-Clip-Password: deploy-check-pw' https://clip.hcyj.xyz/api/clips/$SSFX             # 清理（204）
+
+# g) 真库测试
 TEST_PG_DSN=... scripts/test-pg.sh
 
-# g) 真实浏览器（改过页面/脚本时必须；只依赖 Node 内建，无第三方包）
+# h) 真实浏览器（改过页面/脚本时必须；只依赖 Node 内建，无第三方包）
 node scripts/verify-clip-browser.cjs https://clip.hcyj.xyz
 
-# h) 部署产物能追溯到提交（见「已知约束」里线上那版无法复现的事）
+# i) 部署产物能追溯到提交（见「已知约束」里线上那版无法复现的事）
 git -C <clip repo> status --porcelain                                          # 构建前必须为空
 V=$(curl -s https://clip.hcyj.xyz/api/health | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
 git -C <clip repo> cat-file -e "$V"                                            # 这个提交必须在历史里（-dirty 会在这里挂）
@@ -127,7 +145,11 @@ sudo systemctl restart clip     # 读/raw/图片照旧，PUT/POST/DELETE 返回 
 | 环境变量 | 默认 | 作用 |
 | --- | --- | --- |
 | `CLIP_UNLOCK_PER_HOUR` | 20 | 每个源地址、每个后缀允许的**失败**解锁次数（成功的不过数，见 `clipAccess`） |
-| `CLIP_WRITE_PER_HOUR` | 30 | 每个源地址的**写**预算（创建/更新/设密码/传图/删除**共用一个桶**） |
+| `CLIP_SHARE_CODE_TTL` | 30m | 6 位取件码分享的**上界**（不管创建时要多久），也是取件码默认有效期 |
+| `CLIP_WRITE_PER_HOUR` | 30 | 每个源地址的**写**预算（创建/更新/设密码/传图/删除/**创建分享**共用一个桶） |
+
+分享口令的猜测与 clip 密码**共用** `CLIP_UNLOCK_PER_HOUR` 与同一个 limiter，桶键是
+`ip:<地址>` 与 `share:<token>`（后缀那个桶是 `suffix:<后缀>`，互不干扰）。
 
 ### 自测会把写预算刷爆（踩过，别当成产品 bug）
 

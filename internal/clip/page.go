@@ -37,19 +37,45 @@ type pageData struct {
 	Assets      []AssetMeta
 	ExpiresText string
 	Hint        string
+	// Title is what the browser tab shows; DisplayURL is what the header shows.
+	// They exist because a share page must show the share URL and never the clip's
+	// own suffix (see Share below): the whole point of the token is that /s/<token>
+	// does not reveal the address the owner actually uses.
+	Title      string
+	DisplayURL string
+	// Share marks the read-only second entrance (/s/<token>). In that shape the
+	// page has no save/delete/upload controls, its credential is the SHARE secret
+	// rather than the clip's master password, and the share-management panel is
+	// hidden (a share cannot mint further shares).
+	Share bool
+	// Token is the share's path segment, and CodeMode says the secret the visitor
+	// must type is a 6-digit pickup code rather than a password.
+	Token    string
+	CodeMode bool
+	// RawBase is the origin-relative prefix for /raw and /raw/<n>: `/ops1` for a
+	// clip, `/s/<token>` for a share. APIBase is the origin-relative path the page
+	// reads and unlocks through (`/api/clips/<suffix>` or `/api/shares/<token>`).
+	// Both are computed here so the page's script never has to know which shape it
+	// is rendering — the one place that knows is this struct's constructor.
+	RawBase string
+	APIBase string
+	// SecretLabel and LockHint word the unlock prompt for whichever secret this
+	// page wants ("访问密码" / "分享密码" / "6 位取件码").
+	SecretLabel string
+	LockHint    string
 	// HasPassword and PasswordState drive the "set a password" vs "change the
 	// password" choice, and tell the reader why anyone with the link can edit.
 	HasPassword   bool
 	PasswordState string
-	// Locked means the clip has a password and this response carries none of its
-	// content. The client asks for the password, then fetches the body over the
-	// API — the HTML is the one place protected text could otherwise leak into a
-	// browser that never proved it may see it.
+	// Locked means the clip (or share) has a secret and this response carries none
+	// of its content. The client asks for the secret, then fetches the body over
+	// the API — the HTML is the one place protected text could otherwise leak into
+	// a browser that never proved it may see it.
 	Locked bool
 	// Editable is the server's view. With no password a clip is writable by
 	// whoever opens it (that is the documented model, not an oversight), so the
 	// server can answer this directly instead of asking the client to remember a
-	// token in localStorage.
+	// token in localStorage. A share is NEVER writable.
 	Editable bool
 	CanWrite bool
 	// MaxAssetText is shown in error messages, so a person learns the limit
@@ -126,6 +152,12 @@ func renderPage(w http.ResponseWriter, cfg *Config, suffix string, clip *Clip) {
 		State:         "new",
 		Editable:      true,
 		CanWrite:      true,
+		Title:         suffix,
+		DisplayURL:    cfg.ClipURL(suffix),
+		RawBase:       cfg.ClipPath(suffix),
+		APIBase:       "/api/clips/" + suffix,
+		SecretLabel:   "访问密码",
+		LockHint:      "这个剪贴板设了密码 —— 输入密码才能看到内容。内容没有随这个页面下发，所以未解锁时它不在浏览器的任何地方。",
 		PasswordState: "公开（谁都能看、谁都能改）",
 		ExpiresText:   fmt.Sprintf("%d 小时后", int(cfg.DefaultTTL.Hours())),
 		MaxAssetText:  humanBytes(cfg.MaxAssetBytes),
@@ -170,6 +202,87 @@ func renderPage(w http.ResponseWriter, cfg *Config, suffix string, clip *Clip) {
 	if err := pageTemplate.Execute(w, data); err != nil {
 		// The status line is already written by now; log through the caller's
 		// logger rather than trying to recover a response.
+		_ = err
+	}
+}
+
+// renderSharePage writes the read-only share view at /s/<token>.
+//
+// It is the same document in a deliberately crippled shape: an editor with no
+// save path would be a lie, so the page is rendered read-only from the server's
+// own answer (CanWrite=false) and carries no share-management panel. The clip's
+// suffix is never placed in this document — not in the title, not in the header,
+// not in a data attribute — because the share address is supposed to be usable
+// without revealing (or helping enumerate) the owner's own address.
+//
+// A share WITH a secret renders the locked shell and no content at all: the body
+// is fetched only after the share secret is proved, over /api/shares/<token>. A
+// share without a secret renders the content directly, because the link itself is
+// the credential and there is nothing to unlock.
+//
+// The credential here is the SHARE secret, never the clip's master password. That
+// independence is the entire reason the feature exists — "show a colleague this
+// bit without handing over the master password".
+func renderSharePage(w http.ResponseWriter, cfg *Config, sh *Share, clip *Clip) {
+	nonce, err := newNonce()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	data := pageData{
+		Nonce:        nonce,
+		Share:        true,
+		Token:        sh.Token,
+		CodeMode:     sh.HasCode(),
+		Base:         cfg.PublicBaseURL,
+		Title:        "分享链接",
+		DisplayURL:   cfg.ShareURL(sh.Token),
+		RawBase:      cfg.SharePath(sh.Token),
+		APIBase:      "/api/shares/" + sh.Token,
+		Editable:     false,
+		CanWrite:     false,
+		ExpiresText:  expiresText(sh.ExpiresAt),
+		MaxAssetText: humanBytes(cfg.MaxAssetBytes),
+		SecretLabel:  "分享密码",
+		LockHint:     "这个分享链接需要分享密码 —— 输入之后才能看到内容。",
+	}
+	switch {
+	case sh.HasCode():
+		data.SecretLabel = "6 位取件码"
+		data.LockHint = "这个分享链接需要 6 位取件码 —— 输入之后才能看到内容。"
+		data.PasswordState = "6 位取件码（短时有效）"
+	case sh.HasPassword():
+		data.PasswordState = "分享密码"
+	default:
+		data.PasswordState = "仅链接（拿到链接就能看）"
+	}
+
+	if sh.NeedsSecret() {
+		data.State = "locked"
+		data.Locked = true
+		data.Hint = "这是别人分享给你的只读剪贴板。输入口令后才能看到内容 —— 它没有随这个页面下发。"
+	} else {
+		data.State = "existing"
+		data.Rev = clip.Rev
+		data.Body = clip.Body
+		data.Assets = clip.Assets
+		data.Hint = "这是别人分享给你的只读剪贴板 —— 你能看、能复制，不能改。"
+		if len(clip.Assets) > 0 {
+			data.Hint += fmt.Sprintf("（含 %d 张图片，可点开原图或用 /raw 链接下载。）", len(clip.Assets))
+		}
+	}
+
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Content-Security-Policy", fmt.Sprintf(PageCSP, nonce, nonce))
+	h.Set("Cache-Control", "no-store, must-revalidate")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+
+	if err := pageTemplate.Execute(w, data); err != nil {
 		_ = err
 	}
 }

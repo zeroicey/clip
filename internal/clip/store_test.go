@@ -55,6 +55,11 @@ func testStore(t *testing.T, mutate ...func(*Config)) *Store {
 		MaxTotalBytes: 1 << 30,
 		DefaultTTL:    24 * time.Hour,
 		WritePerHour:  30,
+		// Mirrors config.Load's defaults. Leaving a duration field at its zero value
+		// here is not harmless: a code share's TTL is used as an absolute deadline, so
+		// a zero would mint shares that are born expired and every share test would
+		// fail with a 404 that looks like a routing bug.
+		ShareCodeTTL: 30 * time.Minute,
 		// Non-zero on purpose: a zero limit disables the limiter entirely
 		// (ratelimit treats <= 0 as "unlimited"), so a test config that left it out
 		// would silently stop exercising password throttling.
@@ -432,12 +437,12 @@ func TestSweepDeletesOnlyExpired(t *testing.T) {
 	mustCreate(t, st, "stays", "b", nil, future)
 	mustCreate(t, st, "forever", "c", nil, 0)
 
-	n, err := st.Sweep(ctx)
+	res, err := st.Sweep(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("Sweep deleted %d rows, want 1", n)
+	if res.Clips != 1 {
+		t.Fatalf("Sweep deleted %d clips, want 1", res.Clips)
 	}
 	for _, suffix := range []string{"stays", "forever"} {
 		if _, err := st.Get(ctx, suffix); err != nil {

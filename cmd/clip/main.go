@@ -2,8 +2,12 @@
 //
 // It serves one host at its root: `https://clip.hcyj.xyz/<suffix>` is a scrap of
 // text (plus a few images) that somebody on another machine can open and copy.
-// There is no account anywhere in the flow — reading is anonymous by design and
-// writing is authorised by a token minted when the clip was created.
+// There is no account anywhere in the flow. A clip with no password is public
+// (anyone who knows the address may read and write it); a clip with a password
+// is readable and writable only by someone who knows it. A share link
+// (`/s/<token>`) is a second, read-only entrance to the same content with its own
+// credential, so "show a colleague this bit" does not mean handing over the
+// master password.
 //
 // Usage:
 //
@@ -74,12 +78,12 @@ func main() {
 			log.Info("migrations applied")
 			return
 		case "sweep":
-			n, err := store.Sweep(ctx)
+			res, err := store.Sweep(ctx)
 			if err != nil {
 				log.Error("sweep", "error", err)
 				os.Exit(1)
 			}
-			log.Info("swept expired clips", "deleted", n)
+			log.Info("swept expired rows", "clips", res.Clips, "shares", res.Shares)
 			return
 		}
 	}
@@ -151,14 +155,14 @@ func runJanitor(ctx context.Context, store *clip.Store, log *slog.Logger) {
 			return
 		case <-ticker.C:
 			sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			n, err := store.Sweep(sweepCtx)
+			res, err := store.Sweep(sweepCtx)
 			cancel()
 			if err != nil {
-				log.Warn("sweep expired clips", "error", err)
+				log.Warn("sweep expired rows", "error", err)
 				continue
 			}
-			if n > 0 {
-				log.Info("swept expired clips", "deleted", n)
+			if res.Clips > 0 || res.Shares > 0 {
+				log.Info("swept expired rows", "clips", res.Clips, "shares", res.Shares)
 			}
 		}
 	}

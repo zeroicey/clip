@@ -1,10 +1,12 @@
 # Current task
 
-**Status:** ✅ **已上线并验证** —— 定位 = **webnote.cc 的开源版本**。
-步骤 ①（密码 + MIT LICENSE + 自动保存）已实现、已部署（线上 `9126d5c`）。
-**下一步 = 步骤 ②（只读分享链接 `/s/<token>`）：本会话在这里结束，从
-`.ai/sessions/2026-10-16-share-links-handoff.md` 接着做。**
-**Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-share-links-handoff.md`
+**Status:** 步驟 ② **已实现、已在本地全部验证**，**等人类批准后提交 + 部署** ——
+定位 = **webnote.cc 的开源版本**。
+步骤 ①（密码 + MIT LICENSE + 自动保存）已上线（线上 `9126d5c`）。
+步骤 ②（只读分享链接 `/s/<token>`）代码写完：真库 **21 条分享测试**（+ 原有全部）、
+真浏览器 **74/74 连跑 3 次全绿**、`scripts/check.sh` 全绿、`sqlc diff` 无漂移。
+**下一步 = `git commit`（问过人类）→ 按 `.ai/runbooks/deploy-clip.md` 部署 → 线上验证。**
+**Updated:** 2026-10-16（第三会话）
 
 ### 部署后的线上验证（都是实跑）
 
@@ -55,12 +57,48 @@
 
 **随机后缀生成明确不做**（用户：“我本身就需要一个专属我自己的名字”）。
 
-## 步骤 ② 未开工：分享链接
+## 步骤 ② 已实现（待部署）：分享链接
 
-`.ai/decisions/2026-10-16-clip-share-links.md`（`/s/<token>` 只读、分享密码 **与** 6 位取件码、
-可撤销 + TTL、不复制内容只指向同一份）。`suffix.go` 里 `s`/`k` 早已是保留字。
+裁决：`.ai/decisions/2026-10-16-clip-share-links.md`（✅ ACCEPTED + 2026-10-16 落地补充）。
 
-**Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-clip-split-and-launch-handoff.md`
+| 面 | 落地 |
+| --- | --- |
+| 迁移 | `0003_clip_shares.sql`：`clip_shares(token PK, suffix → clips ON DELETE CASCADE, password_hash, code_hash, expires_at, created_at)` + `suffix` / 部分 `expires_at` 索引 |
+| 代码 | `share.go`（token 22 字符 base64url、6 位取件码、`Share` 类型）、`api_shares.go`（主入口 + 访客读侧）、`queries/shares.sql` |
+| 主入口 | `POST/GET /api/clips/:suffix/shares`、`DELETE .../shares/:token`（都要主密码；写判定在语句里） |
+| 访客侧 | `/s/<token>`、`/s/<token>/raw`、`/s/<token>/raw/<n>`（**只挂 GET/HEAD**，写形状 405），加 `GET /api/shares/:token` 与 `POST .../unlock`（锁壳换内容用） |
+| 三种口令形态 | 仅链接 / 自设分享密码 / 服务端 6 位取件码（只回显一次，TTL 上界 `CLIP_SHARE_CODE_TTL`=30m） |
+| 限流 | 复用 `unlockLimiter`，键 `ip:<地址>` + `share:<token>`，只对失败计费 |
+| 撤销 | 删行即失效；同时 `hub.publish(suffix)` 让在看的长轮询立刻醒来；分享页看见 404 会清掉内容 |
+| 接管 | `Create` 里**显式**清 `clip_shares`（cascade 在 `DO UPDATE` 上不触发；与 `clip_assets` 同一个坑） |
+| 页面 | `page.html` 多一个只读 share 状态（无写入口、不回显后缀）+ 主人页的「分享」区（创建/复制/撤销/一次性取件码） |
+
+**验证（都是实跑）**：
+
+- 真库 `scripts/test-pg.sh -count=1` 全绿（新增 `share_test.go` 21 个测试：只读性、口令独立性、
+  每个读入口不带口令拿不到正文、撤销、cascade、接管清分享、过期/清扫、限流按 token、不回显后缀、
+  取件码只回显一次）。
+- **真浏览器 74/74，连跑 3 次全绿**（每次前重启进程清掉进程内写限流器）。
+- 两条关键守卫**反向验证过**：`shareDecision` 改成放行 → 读路径守卫红；
+  去掉接管时的分享清理 → `TestTakeoverDropsTheOldOwnersShares` 红；恢复后都绿。
+- 真浏览器抓到并修掉一个真 bug：解锁后 `writable = true` 让**只读分享变成了编辑器**
+  （服务端 405 拦住了写入，所以是页面在撒谎）。见
+  `.ai/pitfalls/cases/2026-10-16-share-page-unlocked-into-an-editor.md`。
+  另一个坑：`testStore` 手写 Config 没给 `ShareCodeTTL`，取件码分享生下来就过期 → 正确口令也 404。
+  见 `.ai/pitfalls/cases/2026-10-16-test-config-zero-duration-share-ttl.md`。
+
+**未做 / 待办**：
+
+- [ ] **提交 + 部署 + 线上验证**（等人类批准；runbook 已加 (f) 分享那套验证）。
+- [ ] 线上 `CLIP_SHARE_CODE_TTL` / `CLIP_UNLOCK_PER_HOUR` 写进 `/data/services/clip/clip.env`
+      （模板已补，不写则用默认值）。
+- [ ] `pg_restore` 恢复演练仍未做（仍是最大运维缺口）。
+
+---
+
+（更早的会话：步骤 ① 与仓库拆分，交接文档
+`.ai/sessions/2026-10-16-clip-split-and-launch-handoff.md`；更早的步骤 ① 全过程见
+`.ai/sessions/2026-10-16-share-links-handoff.md`。）
 
 teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.md` 开始读。
 
@@ -110,26 +148,26 @@ teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.
 | webnote.cc | clip |
 | --- | --- |
 | URL = 名字、免注册、跨设备同步、HTTPS | ✅ 有（long-poll 同步） |
-| **设置访问密码** | ✅ **已裁决，待实现**（见 decisions） |
-| 只读模式 | ❌ 用户改成另一个设计：**分享链接「天然只读」**（`/s/<token>`），不做全局只读开关 |
-| 自动保存 | ❌ 现在要点「保存」——**已确认要做** |
+| **设置访问密码** | ✅ **已实现并上线** |
+| 只读模式 | ✅ 已实现为另一个设计：**分享链接「天然只读」**（`/s/<token>`，步骤 ②），不做全局只读开关 |
+| 自动保存 | ✅ 已实现（防抖） |
 | 系统生成随机长链接 | ⛔ **明确不做**（用户要自己的名字，宁愿加密码） |
 | 中文名字 | ❌ 只能 `a-z 0-9 - _`（webnote 支持中文） |
 | 阅后即焚 / 手动销毁 | ⚠️ 有删除，没有「看一次就销毁」 |
 | 全格式文件传送 | ⚠️ 只收图片（4 种，**故意不收 SVG**） |
-| — | ➕ **owner token**：猜到后缀只能读、不能改 |
+| — | ➕ **分享链接**：只读 + 独立口令（自设密码 / 6 位取件码）+ 可撤销 + TTL（步骤 ②） |
 | — | ➕ **`/raw`**：`curl` 直接拿文本（本项目最强的那个功能） |
-| **LICENSE** | ❌ **仓库里一个都没有** —— 已确认要做 |
+| **LICENSE** | ✅ **MIT 已加**（步骤 ①） |
 
 ### ⚠️ 定位变了就要改的硬约定
 
-两条都要改，且**已经裁决**（不是待定）：
+两条都已经改完（步骤 ①）：
 
-1. 「**后缀是公屏，不是密码**」—— 加密码后它只对**无密码的 clip** 继续成立。
-   AGENTS.md、README、页面文案、本文件要一起改。
-2. 「**写要 owner token**」—— **整条废除**。无密码的 clip 谁都能改，密码是唯一凭据。
-   AGENTS.md 硬约定、`suffix.go` 包注释、README、`owner_token` 契约测试、页面 localStorage
-   逻辑都在这条上。
+1. 「**后缀是公屏，不是密码**」—— 现在只对**无密码的 clip** 继续成立。
+   AGENTS.md、README、页面文案、本文件已一起改。
+2. 「**写要 owner token**」—— 已**整条废除**。无密码的 clip 谁都能改，密码是唯一凭据。
+   `owner_token` 已从代码、迁移、契约测试、页面里彻底移除。（分享链接是第三条入口：
+   `/s/<token>` **只读**，见步骤 ②。）
 
 ---
 
@@ -226,7 +264,9 @@ teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.
 ## 长期约束（改动前必须知道）
 
 - **cliff 的所有权语义**：判定写在 SQL 的 `WHERE` 里；不存在/非所有者/已过期一律 404。
-- **后缀是公屏不是密码**；**页面内容永远按文本渲染**；**图片类型从字节嗅探**（无 SVG）。
+- **后缀是公屏不是密码**（对无密码的 clip）；**页面内容永远按文本渲染**；**图片类型从字节嗅探**（无 SVG）。
+- **分享链接 `/s/<token>` 只读且口令独立于主密码**；`on delete cascade` 跟 clip 走，
+ **但接管（DO UPDATE）不触发 cascade，必须显式清 `clip_shares`**。
 - **unknown 后缀的页面是 200 + 空编辑器**，不是 404（第一次访问的预期动作是创建）。
 - **响应 snake_case / 请求 camelCase** —— 有跨语言测试钉住，写错是静默的。
 - **限流键必须用 `internal/clientip`**；**时间一律 epoch 毫秒**，`expires_at=0` = 永不过期。

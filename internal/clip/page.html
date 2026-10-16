@@ -8,7 +8,7 @@
 <meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="no-referrer">
 <meta name="color-scheme" content="light dark">
-<title>{{.Suffix}} · Relay 网络剪贴板</title>
+<title>{{.Title}} · Relay 网络剪贴板</title>
 <style nonce="{{.Nonce}}">
 /* Deliberately self-contained: no webfont, no shared stylesheet, no build step.
    This page has to render on whatever machine happens to have a browser, so it
@@ -87,6 +87,15 @@ details.meta summary{cursor:pointer}
   font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 .note{color:var(--warn)}
+.sharelist{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.sharelist li{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.sharelist a{color:var(--accent);text-decoration:none;word-break:break-all;flex:1;min-width:180px;
+  font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+.sharelist small{color:var(--muted)}
+.sharelist li.muted{color:var(--muted);border:0;padding:0}
+.chk{display:inline-flex;align-items:center;gap:6px;font-size:14px;min-height:36px}
+.chk input{min-height:auto}
 .lockbox{
   border:1px solid var(--line);border-radius:10px;background:var(--card);
   padding:16px;display:flex;flex-direction:column;gap:12px;
@@ -98,10 +107,14 @@ details.meta summary{cursor:pointer}
 </head>
 <body
   data-clip
+  data-share="{{.Share}}"
   data-suffix="{{.Suffix}}"
+  data-token="{{.Token}}"
   data-rev="{{.Rev}}"
   data-state="{{.State}}"
   data-base="{{.Base}}"
+  data-api-base="{{.APIBase}}"
+  data-raw-base="{{.RawBase}}"
   data-expires="{{.ExpiresText}}"
   data-max-asset="{{.MaxAssetText}}"
   data-has-password="{{.HasPassword}}"
@@ -109,18 +122,17 @@ details.meta summary{cursor:pointer}
 
 <header>
   <a class="brand" href="/">Relay <span>网络剪贴板</span></a>
-  <span class="addr" id="addr">{{.Base}}/{{.Suffix}}</span>
+  <span class="addr" id="addr">{{.DisplayURL}}</span>
 </header>
 
 <main>
   <p class="hint" id="hint">{{.Hint}}</p>
 
   <section class="lockbox" id="lockbox"{{if not .Locked}} hidden{{end}}>
-    <p class="hint">这个剪贴板设了密码 —— 输入密码才能看到内容。内容没有随这个页面下发，
-      所以未解锁时它不在浏览器的任何地方。</p>
+    <p class="hint">{{.LockHint}}</p>
     <div class="row">
       <input type="password" id="pw" autocomplete="current-password"
-        aria-label="访问密码" placeholder="访问密码">
+        aria-label="{{.SecretLabel}}" placeholder="{{.SecretLabel}}">
       <button class="primary" id="unlock" type="button">解锁</button>
     </div>
     <p class="status" id="lockstatus" role="status" aria-live="polite"></p>
@@ -130,7 +142,7 @@ details.meta summary{cursor:pointer}
     <textarea id="body" spellcheck="false" autocapitalize="off" autocomplete="off"
       aria-label="剪贴板内容"{{if not .Editable}} readonly{{end}}>{{.Body}}</textarea>
 
-    <div class="thumbs" id="thumbs">{{range .Assets}}<figure><a href="{{$.Base}}/{{$.Suffix}}/raw/{{.Position}}" target="_blank" rel="noopener"><img src="{{$.Base}}/{{$.Suffix}}/raw/{{.Position}}" alt="图片 {{.Position}}"></a></figure>{{end}}</div>
+    <div class="thumbs" id="thumbs">{{range .Assets}}<figure><a href="{{$.RawBase}}/raw/{{.Position}}" target="_blank" rel="noopener"><img src="{{$.RawBase}}/raw/{{.Position}}" alt="图片 {{.Position}}"></a></figure>{{end}}</div>
 
     <div class="row" id="actions">
       <button class="primary" id="save" hidden>保存</button>
@@ -147,9 +159,10 @@ details.meta summary{cursor:pointer}
     <dl>
       <dt>版本</dt><dd id="rev">{{.Rev}}</dd>
       <dt>过期</dt><dd id="exp">{{.ExpiresText}}</dd>
-      <dt>密码</dt><dd id="pwstate">{{.PasswordState}}</dd>
-      <dt>纯文本</dt><dd><a href="{{.Base}}/{{.Suffix}}/raw">{{.Base}}/{{.Suffix}}/raw</a></dd>
+      <dt>{{if .Share}}口令{{else}}密码{{end}}</dt><dd id="pwstate">{{.PasswordState}}</dd>
+      <dt>纯文本</dt><dd><a href="{{.RawBase}}/raw">{{.Base}}{{.RawBase}}/raw</a></dd>
     </dl>
+    {{if not .Share}}
     <div class="keybox">
       <input type="password" id="newpw" autocomplete="new-password"
         aria-label="新密码" placeholder="新密码（至少 4 个字符）">
@@ -159,16 +172,51 @@ details.meta summary{cursor:pointer}
     <p class="meta note" id="pwnote">密码只存 argon2id 哈希，<b>忘了找不回来</b> —— 没有找回流程，
       只能等它过期（或换一个后缀重来）。<br>
       没设密码时，知道这个网址的人<b>都能读、也都能改</b>，任何人都能给它设一个密码把它变成自己的。<br>
-      命令行读带密码的内容：<code>curl -H 'X-Clip-Password: 密码' {{.Base}}/{{.Suffix}}/raw</code></p>
+      命令行读带密码的内容：<code>curl -H 'X-Clip-Password: 密码' {{.Base}}{{.RawBase}}/raw</code></p>
+    {{end}}
   </details>
+
+  {{if not .Share}}
+  <details class="share" id="sharebox" hidden>
+    <summary>分享（只读链接）</summary>
+    <p class="meta">分享出去的是一个<b>只读</b>入口：拿到链接的人只能看、不能改，
+      <b>也不需要你的主密码</b>。口令独立设置 —— 留空就是「拿到链接就能看」；
+      勾选「用 6 位取件码」则由服务器生成一个短时有效的数字口令。
+      <b>分享口令忘了只能撤销重来。</b></p>
+    <div class="row">
+      <input type="password" id="sharepw" autocomplete="new-password"
+        aria-label="分享密码" placeholder="分享密码（留空=链接即可看）">
+      <label class="chk"><input type="checkbox" id="sharecode"> 用 6 位取件码</label>
+      <input type="number" id="sharettl" min="0" step="1" inputmode="numeric"
+        aria-label="有效小时数" placeholder="有效小时（留空=默认）">
+      <button id="createshare" type="button">创建分享链接</button>
+    </div>
+    <p class="status" id="sharestatus" role="status" aria-live="polite"></p>
+    <div class="keybox" id="sharecodeout" hidden>
+      <input type="text" id="sharecodevalue" readonly aria-label="取件码" placeholder="取件码">
+      <button id="copycode" type="button">复制取件码</button>
+      <small class="note">取件码只显示这一次。</small>
+    </div>
+    <ul class="sharelist" id="sharelist"></ul>
+  </details>
+  {{end}}
 </main>
 
 <script nonce="{{.Nonce}}">
 "use strict";
 (function () {
   var root = document.body;
+  // Two shapes of the same document: a clip (owner's entrance, maybe writable)
+  // and a share (the read-only second entrance, never writable). Everything that
+  // differs — which endpoints to call, where the raw views live, which secret the
+  // prompt asks for — is already decided by the server and arrives here as data
+  // attributes, so the script never has to reconstruct the URL shape itself.
+  var isShare = root.dataset.share === "true";
   var suffix = root.dataset.suffix;
+  var token = root.dataset.token;
   var base = root.dataset.base;
+  var apiBase = root.dataset.apiBase;
+  var rawBase = root.dataset.rawBase;
   var rev = parseInt(root.dataset.rev, 10) || 0;
   var state = root.dataset.state;
   var exists = state !== "new";
@@ -191,6 +239,16 @@ details.meta summary{cursor:pointer}
   var pwInput = document.getElementById("pw");
   var newPw = document.getElementById("newpw");
   var pwState = document.getElementById("pwstate");
+  // Share management exists only on a clip page: the markup for it is not rendered
+  // in the share view, so these are null there and every use is guarded.
+  var sharebox = document.getElementById("sharebox");
+  var shareList = document.getElementById("sharelist");
+  var shareStatus = document.getElementById("sharestatus");
+  var sharePw = document.getElementById("sharepw");
+  var shareCode = document.getElementById("sharecode");
+  var shareTtl = document.getElementById("sharettl");
+  var shareCodeOut = document.getElementById("sharecodeout");
+  var shareCodeValue = document.getElementById("sharecodevalue");
 
   var PREFIX = "relay.clip.pw.";
   // sessionStorage, not localStorage, and deliberately: the password belongs to
@@ -198,9 +256,14 @@ details.meta summary{cursor:pointer}
   // to make "two tabs" behave like one machine and break the read/write
   // separation this page is supposed to demonstrate
   // (.ai/pitfalls/cases/two-tabs-are-not-two-machines.md).
-  function storedPw() { try { return sessionStorage.getItem(PREFIX + suffix) || ""; } catch (e) { return ""; } }
+  //
+  // A share's secret lives under its own key: it is not the clip's master
+  // password and must never be offered to the clip's own entrance (nor the other
+  // way round), even when both are open in one browser.
+  var credKey = isShare ? "relay.share.pw." + token : PREFIX + suffix;
+  function storedPw() { try { return sessionStorage.getItem(credKey) || ""; } catch (e) { return ""; } }
   function storePw(p) {
-    try { if (p) sessionStorage.setItem(PREFIX + suffix, p); else sessionStorage.removeItem(PREFIX + suffix); } catch (e) {}
+    try { if (p) sessionStorage.setItem(credKey, p); else sessionStorage.removeItem(credKey); } catch (e) {}
   }
 
   var password = storedPw();
@@ -232,12 +295,17 @@ details.meta summary{cursor:pointer}
 
   function paint() {
     // Editing is enabled only when this browser can actually save: a textarea
-    // someone can type into but not save is worse than a read-only one.
+    // someone can type into but not save is worse than a read-only one. A share
+    // is rendered with canWrite=false, so this is also where the read-only
+    // entrance loses every editing control.
     body.readOnly = !writable;
     saveBtn.hidden = !writable;
     addImg.hidden = !writable;
     delBtn.hidden = !writable || !exists;
-    if (locked) return;
+    // Share management is an OWNER action: a share cannot mint further shares,
+    // and an unreadable (locked) page must not offer to hand out access.
+    if (sharebox) sharebox.hidden = isShare || !writable;
+    if (locked || isShare) return;
     pwState.textContent = hasPassword ? "已设密码（本标签页已解锁）" : "未设密码（谁都能读、谁都能改）";
   }
 
@@ -245,7 +313,7 @@ details.meta summary{cursor:pointer}
 
   async function api(method, path, opts) {
     opts = opts || {};
-    var res = await fetch(base + path, {
+    var res = await fetch(apiBase + path, {
       method: method,
       headers: authHeaders(opts.headers || {}),
       body: opts.body,
@@ -271,10 +339,18 @@ details.meta summary{cursor:pointer}
       data.assets.forEach(function (a) {
         var fig = document.createElement("figure");
         var link = document.createElement("a");
-        link.href = base + "/" + suffix + "/raw/" + a.position;
+        // The URL is built here rather than taken from the response, and the
+        // node is created with DOM calls, never innerHTML: the author of a clip
+        // is an unauthenticated stranger. rawBase is the server's answer for
+        // which entrance this page is (`/ops1` or `/s/<token>`), so a share
+        // never builds a URL that exposes the owner's suffix.
+        link.href = rawBase + "/raw/" + a.position;
         link.target = "_blank";
         link.rel = "noopener";
         var img = document.createElement("img");
+        // The URL is built here rather than taken from the response, and the
+        // node is created with DOM calls, never innerHTML: the author of a clip
+        // is an unauthenticated stranger.
         // The URL is built here rather than taken from the response, and the
         // node is created with DOM calls, never innerHTML: the author of a clip
         // is an unauthenticated stranger.
@@ -296,7 +372,7 @@ details.meta summary{cursor:pointer}
     var payload = JSON.stringify({ body: body.value });
     var headers = { "Content-Type": "application/json" };
     try {
-      var r = await api("PUT", "/api/clips/" + encodeURIComponent(suffix), { headers: headers, body: payload });
+      var r = await api("PUT", "", { headers: headers, body: payload });
       // Field names come from the wire, not from Go: requests are camelCase and
       // responses are snake_case. Getting it backwards is silent, which is why a
       // contract test pins both halves.
@@ -353,7 +429,7 @@ details.meta summary{cursor:pointer}
     setStatus(lockStatus, "解锁中…");
     password = pw;
     try {
-      var r = await api("POST", "/api/clips/" + encodeURIComponent(suffix) + "/unlock", {
+      var r = await api("POST", "/unlock", {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password: pw })
       });
@@ -362,7 +438,14 @@ details.meta summary{cursor:pointer}
       if (r.ok && r.json && r.json.data) {
         storePw(pw);
         locked = false;
-        writable = true;
+        // Unlocking grants WRITE only on the clip's own entrance. On a share it
+        // grants read and nothing else: canWrite is false there, but the clip
+        // path deliberately reports canWrite=false while locked too (the password
+        // is the write credential), so "unlocked" cannot simply mean "writable".
+        // Getting this wrong produced an editor with a visible Save and Delete on
+        // a read-only link — the writes were refused by the server (405), so the
+        // page was lying rather than the content being at risk.
+        writable = !isShare;
         content.hidden = false;
         if (lockbox) lockbox.hidden = true;
         setStatus(lockStatus, "");
@@ -372,6 +455,11 @@ details.meta summary{cursor:pointer}
         startPolling();
         return;
       }
+      // A revoked or expired share is a 404, and it must not leave the visitor
+      // staring at stale text as if the link still worked. The content is cleared
+      // for the same reason enterLocked clears it: the page is no longer
+      // authorised to have it on screen.
+      if (r.status === 404 && isShare) { enterDeadShare(); return; }
       // Wrong password and "no password" are told apart on purpose: the server
       // says which, and neither answer reveals anything the page had not already
       // revealed by asking at all.
@@ -418,6 +506,29 @@ details.meta summary{cursor:pointer}
     }
   }
 
+  // enterDeadShare is what a share page does when its link stops resolving: the
+  // owner revoked it, or it expired. The content is cleared and the explanation
+  // goes in the page-level hint, because the normal status line lives inside the
+  // content block that this function is about to hide.
+  function enterDeadShare() {
+    locked = true;
+    writable = false;
+    polling = false;
+    pollGen++;
+    abortPoll();
+    password = "";
+    storePw("");
+    body.value = "";
+    lastLoaded = "";
+    thumbs.textContent = "";
+    content.hidden = true;
+    if (lockbox) lockbox.hidden = true;
+    if (sharebox) sharebox.hidden = true;
+    paint();
+    var hint = document.getElementById("hint");
+    if (hint) hint.textContent = "这个分享链接已经失效了（被撤销或已过期）。";
+  }
+
   // restartPolling retires the current poll and starts a fresh one. It is called
   // whenever the credential changes: the request that is parked on the server
   // was authorised with the OLD credential, and the server re-checks on wake-up,
@@ -434,7 +545,7 @@ details.meta summary{cursor:pointer}
   async function setPassword() {
     var pw = newPw.value;
     if (!pw) { say("先在上面填一个密码。", "err"); return; }
-    var r = await api("PUT", "/api/clips/" + encodeURIComponent(suffix) + "/password", {
+    var r = await api("PUT", "/password", {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ password: pw })
     });
@@ -454,7 +565,7 @@ details.meta summary{cursor:pointer}
 
   async function clearPassword() {
     if (!confirm("去掉密码？去掉之后知道这个网址的人都能读、都能改。")) return;
-    var r = await api("DELETE", "/api/clips/" + encodeURIComponent(suffix) + "/password");
+    var r = await api("DELETE", "/password");
     if (r.ok && r.json && r.json.data) {
       password = "";
       storePw("");
@@ -475,7 +586,7 @@ details.meta summary{cursor:pointer}
     for (var i = 0; i < list.length; i++) fd.append("images", list[i]);
     say("上传中…");
     try {
-      var r = await api("POST", "/api/clips/" + encodeURIComponent(suffix) + "/assets", { body: fd });
+      var r = await api("POST", "/assets", { body: fd });
       if (r.ok) { say("图片已上传", "ok"); if (r.json && r.json.data) applyClip(r.json.data); }
       else if (r.status === 404) say("这份剪贴板不存在，或者已经过期。", "err");
       else if (r.status === 401) say("需要密码才能加图片。", "err");
@@ -489,16 +600,129 @@ details.meta summary{cursor:pointer}
     }
   }
 
+  // ---- share management (owner side) -------------------------------------
+  //
+  // Creating and revoking happen over the clip's own API, behind the clip's own
+  // password (authHeaders already carries it). Nothing here can write to a share:
+  // a share is read-only by construction, and this panel only mints and drops
+  // credentials.
+  function shareSay(msg, tone) { setStatus(shareStatus, msg, tone); }
+
+  async function loadShares() {
+    if (!sharebox || isShare || locked || !exists) return;
+    var r = await api("GET", "/shares");
+    if (r.status === 401) { shareSay("需要主密码才能管理分享（先解锁）。", "err"); return; }
+    if (!r.ok || !r.json || !r.json.data) {
+      shareSay("读取分享列表失败（HTTP " + r.status + "）。", "err");
+      return;
+    }
+    renderShares((r.json.data && r.json.data.shares) || []);
+  }
+
+  function renderShares(list) {
+    if (!shareList) return;
+    // textContent/DOM building throughout, never innerHTML: a share URL is
+    // server-generated, but the rule that this page never builds markup from data
+    // is what keeps that true after the next change.
+    shareList.textContent = "";
+    if (!list.length) {
+      var empty = document.createElement("li");
+      empty.className = "muted";
+      empty.textContent = "还没有分享链接。";
+      shareList.appendChild(empty);
+      return;
+    }
+    list.forEach(function (sh) {
+      var li = document.createElement("li");
+
+      var a = document.createElement("a");
+      a.href = sh.url;
+      a.textContent = sh.url;
+      a.target = "_blank";
+      a.rel = "noopener";
+      li.appendChild(a);
+
+      var what = document.createElement("small");
+      what.textContent = (sh.has_code ? "6 位取件码" : (sh.has_password ? "分享密码" : "仅链接")) +
+        " · " + (sh.expires_text || "");
+      li.appendChild(what);
+
+      var copy = document.createElement("button");
+      copy.type = "button";
+      copy.textContent = "复制链接";
+      copy.addEventListener("click", function () { copyToClipboard(sh.url, "已复制分享链接"); });
+      li.appendChild(copy);
+
+      var rev = document.createElement("button");
+      rev.type = "button";
+      rev.textContent = "撤销";
+      rev.addEventListener("click", function () { revokeShare(sh.token); });
+      li.appendChild(rev);
+
+      shareList.appendChild(li);
+    });
+  }
+
+  async function createShare() {
+    var payload = { code: shareCode.checked };
+    if (sharePw.value && !shareCode.checked) payload.password = sharePw.value;
+    if (shareTtl.value !== "") payload.expiresInHours = Number(shareTtl.value);
+    shareSay("创建中…");
+    var r = await api("POST", "/shares", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (r.ok && r.json && r.json.data) {
+      var d = r.json.data;
+      if (shareCodeOut) shareCodeOut.hidden = !d.code;
+      if (d.code && shareCodeValue) shareCodeValue.value = d.code;
+      sharePw.value = "";
+      shareSay(d.code ? "已创建：把取件码和链接分别告诉对方，取件码只显示这一次。" : "已创建只读分享链接。", "ok");
+      loadShares();
+      return;
+    }
+    shareSay(r.json && r.json.error ? r.json.error.message : "创建失败（HTTP " + r.status + "）。", "err");
+  }
+
+  async function revokeShare(token) {
+    if (!confirm("撤销这个分享链接？对方马上就不能再看了。")) return;
+    var r = await api("DELETE", "/shares/" + encodeURIComponent(token));
+    if (r.status === 204) { shareSay("已撤销。", "ok"); loadShares(); return; }
+    shareSay(r.json && r.json.error ? r.json.error.message : "撤销失败（HTTP " + r.status + "）。", "err");
+  }
+
+  async function copyToClipboard(text, okMsg) {
+    try {
+      await navigator.clipboard.writeText(text);
+      shareSay(okMsg, "ok");
+    } catch (e) {
+      shareSay("复制不了，请手动选中：" + text, "err");
+    }
+  }
+
   if (lockbox) {
     document.getElementById("unlock").addEventListener("click", unlock);
     pwInput.addEventListener("keydown", function (ev) { if (ev.key === "Enter") unlock(); });
   }
-  document.getElementById("setpw").addEventListener("click", setPassword);
-  document.getElementById("clearpw").addEventListener("click", clearPassword);
+  // The password panel is not rendered on a share page, so this wiring must not
+  // assume those elements exist.
+  var setPwBtn = document.getElementById("setpw");
+  var clearPwBtn = document.getElementById("clearpw");
+  if (setPwBtn) setPwBtn.addEventListener("click", setPassword);
+  if (clearPwBtn) clearPwBtn.addEventListener("click", clearPassword);
+  if (sharebox) {
+    // Loaded lazily when the panel is opened: a page view that is not about
+    // sharing should not spend a request (nor trip the unlock budget) on it.
+    sharebox.addEventListener("toggle", function () { if (sharebox.open) loadShares(); });
+    document.getElementById("createshare").addEventListener("click", createShare);
+    document.getElementById("copycode").addEventListener("click", function () {
+      copyToClipboard(shareCodeValue.value, "已复制取件码");
+    });
+  }
   saveBtn.addEventListener("click", function () { save(false); });
   delBtn.addEventListener("click", async function () {
     if (!confirm("删除这份剪贴板？内容立刻消失，无法恢复。")) return;
-    var r = await api("DELETE", "/api/clips/" + encodeURIComponent(suffix));
+    var r = await api("DELETE", "");
     if (r.status === 204) {
       // Stay on the address instead of navigating away: the suffix is free
       // again, so "delete, then immediately write something else here" needs no
@@ -566,7 +790,7 @@ details.meta summary{cursor:pointer}
     while (polling && gen === pollGen) {
       try {
         pollCtl = new AbortController();
-        var r = await api("GET", "/api/clips/" + encodeURIComponent(suffix) + "?rev=" + rev + "&wait=25",
+        var r = await api("GET", "?rev=" + rev + "&wait=25",
           { signal: pollCtl.signal });
         if (r.status === 401) {
           // The clip was protected (or re-keyed) while this page was watching.
@@ -574,6 +798,7 @@ details.meta summary{cursor:pointer}
           enterLocked("这份剪贴板已经设了密码，输入密码继续。");
           return;
         }
+        if (r.status === 404 && isShare) { enterDeadShare(); return; }
         if (r.ok && r.json && r.json.data) {
           var d = r.json.data;
           if (typeof d.rev === "number" && d.rev !== rev) {
@@ -606,6 +831,11 @@ details.meta summary{cursor:pointer}
 
   paint();
   if (exists) startPolling();
+  // A share link is normally reopened in the same tab (a refresh), and this tab
+  // already proved the secret to get here — so use it rather than asking again.
+  // The clip page deliberately does NOT do this: there the lock is also the
+  // "stop being able to edit" boundary, and re-prompting is the honest default.
+  if (locked && isShare && password) unlock();
   window.addEventListener("beforeunload", function (ev) {
     if (dirty()) { ev.preventDefault(); ev.returnValue = ""; }
   });

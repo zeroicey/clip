@@ -277,13 +277,15 @@ func proofParam(proof string) pgtype.Text {
 	return pgtype.Text{String: proof, Valid: true}
 }
 
-// passwordParam converts a freshly computed hash into the nullable column value;
-// nil means the clip being created is public.
-func passwordParam(hash *string) pgtype.Text {
-	if hash == nil {
+// nullableText converts an optional string into the nullable column value; nil
+// means SQL NULL. It is the shape every optional credential/hash column takes
+// (`clips.password_hash`, `clip_shares.password_hash`, `clip_shares.code_hash`),
+// so the conversion lives in one place rather than three near-identical ones.
+func nullableText(v *string) pgtype.Text {
+	if v == nil {
 		return pgtype.Text{}
 	}
-	return pgtype.Text{String: *hash, Valid: true}
+	return pgtype.Text{String: *v, Valid: true}
 }
 
 // Create claims a suffix and writes the first body.
@@ -321,7 +323,7 @@ func (s *Store) Create(ctx context.Context, suffix string, body string, expiresA
 		Suffix:       suffix,
 		Body:         body,
 		BodyBytes:    int64(len(body)),
-		PasswordHash: passwordParam(passwordHash),
+		PasswordHash: nullableText(passwordHash),
 		ExpiresAt:    expiresAt,
 		NowMs:        now,
 	})
@@ -339,6 +341,12 @@ func (s *Store) Create(ctx context.Context, suffix string, body string, expiresA
 	// them here; on a fresh insert this deletes nothing.
 	if err := q.DeleteAssets(ctx, suffix); err != nil {
 		return nil, fmt.Errorf("clear assets on claim: %w", err)
+	}
+	// Shares have exactly the same problem, and it is worse: a surviving share
+	// would keep a working READ link to content that now belongs to somebody
+	// else — the old holder's link silently exposing the new holder's text.
+	if err := q.DeleteSharesForSuffix(ctx, suffix); err != nil {
+		return nil, fmt.Errorf("clear shares on claim: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -510,17 +518,32 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	}, nil
 }
 
-// Sweep deletes clips whose TTL has passed and reports how many rows went.
+// SweepResult reports what one sweep reclaimed.
+type SweepResult struct {
+	Clips  int64
+	Shares int64
+}
+
+// Sweep deletes clips and shares whose TTL has passed.
 //
-// It is a backstop, not the mechanism: every read filters on expiry, so a clip
-// is unreachable the moment it expires whether or not this has run. Deletion is
-// about reclaiming space and keeping the suffix addressable again.
-func (s *Store) Sweep(ctx context.Context) (int64, error) {
-	n, err := s.q.DeleteExpiredClips(ctx, s.nowMS())
+// It is a backstop, not the mechanism: every read filters on expiry, so a clip or
+// share is unreachable the moment it expires whether or not this has run.
+// Deletion is about reclaiming space and keeping the suffix addressable again.
+//
+// A share is swept on its OWN expiry, independently of its clip: a 30-minute
+// pickup-code link to a clip that lives a week must not sit in the table for the
+// rest of the week (nor keep 10^6-code guessing viable for that long).
+func (s *Store) Sweep(ctx context.Context) (SweepResult, error) {
+	now := s.nowMS()
+	clips, err := s.q.DeleteExpiredClips(ctx, now)
 	if err != nil {
-		return 0, fmt.Errorf("sweep expired clips: %w", err)
+		return SweepResult{}, fmt.Errorf("sweep expired clips: %w", err)
 	}
-	return n, nil
+	shares, err := s.q.DeleteExpiredShares(ctx, now)
+	if err != nil {
+		return SweepResult{}, fmt.Errorf("sweep expired shares: %w", err)
+	}
+	return SweepResult{Clips: clips, Shares: shares}, nil
 }
 
 // checkQuota fails when one more write would push the service past its ceiling.

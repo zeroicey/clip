@@ -53,8 +53,14 @@ type Config struct {
 	// UnlockPerHour bounds password GUESSES per source address and per suffix
 	// (see Server.clipAccess). Only failures are charged, so it needs to be high
 	// enough that an honest reader re-sending its password on every long poll
-	// never touches it — its whole job is to make guessing expensive.
+	// never touches it — its whole job is to make guessing expensive. The same
+	// budget and the same limiter cover share secrets, keyed per share token.
 	UnlockPerHour int
+	// ShareCodeTTL is the lifetime of a server-generated 6-digit pickup code.
+	// Short on purpose: ten to the sixth possibilities are only safe behind a
+	// short window plus the per-token guess budget (see Server.shareDecision).
+	// A code share is never allowed to outlive this, whatever the caller asks.
+	ShareCodeTTL time.Duration
 	// MaxTotalClips and MaxTotalBytes are the global ceilings. They are the
 	// actual backstop: a per-IP limit is a speed bump, and an attacker with a
 	// handful of addresses walks around it. When either ceiling is reached the
@@ -89,10 +95,14 @@ func Load() (*Config, error) {
 		WritesEnabled: true,
 		DefaultTTL:    24 * time.Hour,
 		DBMaxConns:    8,
+		ShareCodeTTL:  30 * time.Minute,
 	}
 
 	var err error
 	if cfg.DefaultTTL, err = envDuration("CLIP_DEFAULT_TTL", 24*time.Hour); err != nil {
+		return nil, err
+	}
+	if cfg.ShareCodeTTL, err = envDuration("CLIP_SHARE_CODE_TTL", 30*time.Minute); err != nil {
 		return nil, err
 	}
 	if cfg.MaxBodyBytes, err = envInt64("CLIP_MAX_BODY_BYTES", 256<<10); err != nil {
@@ -148,6 +158,11 @@ func Load() (*Config, error) {
 	if cfg.DefaultTTL <= 0 {
 		return nil, fmt.Errorf("CLIP_DEFAULT_TTL must be positive (got %s)", cfg.DefaultTTL)
 	}
+	// A code share's whole security argument rests on a short window, so a TTL at
+	// or above the clip's own default would silently remove it.
+	if cfg.ShareCodeTTL <= 0 {
+		return nil, fmt.Errorf("CLIP_SHARE_CODE_TTL must be positive (got %s)", cfg.ShareCodeTTL)
+	}
 	return cfg, nil
 }
 
@@ -160,6 +175,28 @@ func (c *Config) ClipURL(suffix string) string {
 func (c *Config) RawURL(suffix string) string {
 	return c.PublicBaseURL + "/" + suffix + "/raw"
 }
+
+// ShareURL is the read-only second entrance to a clip.
+func (c *Config) ShareURL(token string) string {
+	return c.PublicBaseURL + "/s/" + token
+}
+
+// ShareRawURL is the share's plain-text view, for curl on the other machine.
+func (c *Config) ShareRawURL(token string) string {
+	return c.ShareURL(token) + "/raw"
+}
+
+// ShareAssetURL addresses one image through the share entrance.
+func (c *Config) ShareAssetURL(token string, position int16) string {
+	return fmt.Sprintf("%s/s/%s/raw/%d", c.PublicBaseURL, token, position)
+}
+
+// ClipPath is the origin-relative path prefix of a clip's page and raw views,
+// used by the page to build asset URLs without depending on its own URL shape.
+func (c *Config) ClipPath(suffix string) string { return "/" + suffix }
+
+// SharePath is ClipPath for the share entrance.
+func (c *Config) SharePath(token string) string { return "/s/" + token }
 
 func env(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
