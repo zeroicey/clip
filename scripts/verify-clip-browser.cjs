@@ -36,6 +36,10 @@ const CHROME = process.env.CHROME
 const OUT = process.env.VERIFY_OUT
   || path.join(__dirname, '..', 'bin', 'e2e', 'localtest');
 const SFX = `br${Date.now().toString(36)}`;
+// Printed up front so a failure can be correlated with the server's own access
+// log (`journalctl -u clip | grep <suffix>`). Without it, a flaky browser failure
+// leaves you guessing which requests belonged to the run.
+console.log(`clip suffix: ${SFX}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const results = [];
@@ -43,6 +47,26 @@ const check = (name, ok, detail = '') => {
   results.push({ name, ok, detail });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  — ${detail}` : ''}`);
 };
+
+// A 429 is almost never a product bug when this script is the client: the write
+// limiter is per source address across ALL clips (CLIP_WRITE_PER_HOUR, default
+// 30/h), and one full run costs about seven writes. So the fourth run inside an
+// hour starts failing in ways that look like broken features — a clip that never
+// gets its password, a cleanup that 404s, a watcher that never switches. Naming
+// the cause here is the difference between a five-minute diagnosis and an hour
+// spent hunting a phantom.
+const THROTTLE_HELP = [
+  'being rate-limited (HTTP 429): the per-IP write budget is exhausted.',
+  '  Each run of this script costs ~7 writes; the default budget is 30/hour.',
+  '  Wait for the window, or raise CLIP_WRITE_PER_HOUR on the instance under test.',
+  '  Do not read the failures below as product bugs.',
+].join('\n    ');
+
+function failThrottled(where, status) {
+  if (status !== 429) return false;
+  console.log(`\n  ${where}: ${THROTTLE_HELP}`);
+  process.exit(3);
+}
 
 async function getJSON(url, method = 'GET') {
   const res = await fetch(url, { method });
@@ -75,7 +99,11 @@ class Session {
       if (m.id && this.pending.has(m.id)) {
         const { resolve, reject } = this.pending.get(m.id);
         this.pending.delete(m.id);
-        m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result);
+        if (m.error) {
+          reject(new Error(JSON.stringify(m.error)));
+        } else {
+          resolve(m.result);
+        }
         return;
       }
       // Console errors are how a CSP violation shows up: the page silently loses
@@ -242,6 +270,15 @@ async function main() {
     // status line have to work together in a real browser.
     const autoSaved = await waitFor(writer,
       'document.getElementById("status").textContent.includes("已自动保存")');
+    if (!autoSaved) {
+      // The page reports a 429 in its own words, so it can be told apart from a
+      // real autosave failure without guessing.
+      const msg = await writer.eval('document.getElementById("status").textContent');
+      if (msg.includes('频繁')) {
+        console.log(`\n  autosave: ${THROTTLE_HELP}`);
+        process.exit(3);
+      }
+    }
     check('typing alone triggers autosave (no click)', autoSaved,
       await writer.eval('document.getElementById("status").textContent'));
     check('no credential is kept in localStorage any more',
@@ -278,6 +315,7 @@ async function main() {
     });
     check('a public clip accepts a credential-free update', put.status === 200,
       `status ${put.status} ${put.body.slice(0, 120)}`);
+    failThrottled('PUT /api/clips', put.status);
 
     const live = await waitFor(reader, `document.getElementById("body").value.includes('appended from machine A')`, 35000);
     check('the watching reader updated without a reload', live,
@@ -324,8 +362,13 @@ async function main() {
       document.getElementById('unlock').click();
       return true;
     })()`);
+    // Wait for a TERMINAL state, not merely for non-empty text: the handler sets
+    // "解锁中…" synchronously, so waiting for "non-empty" would fire the next
+    // attempt while this one is still in flight — which is how two overlapping
+    // unlock requests masked a real race in the page (see
+    // .ai/pitfalls/cases/2026-10-16-overlapping-unlock-attempts.md).
     const refused = await waitFor(stranger,
-      'document.getElementById("lockstatus").textContent.length > 0');
+      '(() => { const t = document.getElementById("lockstatus").textContent; return t.length > 0 && !t.includes("解锁中"); })()');
     check('a wrong password is refused with a message', refused,
       await stranger.eval('document.getElementById("lockstatus").textContent'));
     check('a refused unlock reveals no content',
@@ -339,8 +382,23 @@ async function main() {
     })()`);
     const unlocked = await waitFor(stranger,
       'document.getElementById("body").value.includes("appended from machine A")');
+    // The stale "密码不对。" from the previous attempt must be cleared by a
+    // successful unlock, or the page shows an error next to content that is
+    // plainly there (observed: a green run whose detail text read "密码不对。").
+    check('a successful unlock clears the previous error',
+      (await stranger.eval('document.getElementById("lockstatus").textContent')) === '',
+      await stranger.eval('document.getElementById("lockstatus").textContent'));
     check('the right password reveals the content', unlocked,
       await stranger.eval('document.getElementById("lockstatus").textContent'));
+    if (!unlocked) {
+      // The failure that matters here is a page that unlocked and THEN lost the
+      // content again (a later 401 calling enterLocked). Those two states look
+      // identical from the outside, so print what the page actually saw.
+      console.log('    debug: stranger console =', JSON.stringify(stranger.console, null, 2));
+      console.log('    debug: stranger failed  =', JSON.stringify(stranger.failed, null, 2));
+      console.log('    debug: stranger state   =', await stranger.eval(
+        'JSON.stringify({state: document.body.dataset.state, hidden: document.getElementById("content").hidden, body: document.getElementById("body").value.slice(0,20), msg: document.getElementById("lockstatus").textContent})'));
+    }
 
     // ---- the machine-readable paths are gated too ---------------------------
     check('GET /raw without the password is refused',
@@ -391,10 +449,15 @@ async function main() {
     //     were watching it, so the server (correctly) refused the request that
     //     was already parked. Chrome logs every failed resource load, so this
     //     shows up as console noise even though the page handles it.
+    //     Matched on "status of 401" rather than on the full message: the reason
+    //     phrase is an HTTP/1.1 thing. Locally this reads "401 (Unauthorized)",
+    //     but the deployed service answers over HTTP/2, where it is just
+    //     "401 ()" — a pattern written from the local observation silently stops
+    //     matching in production.
     //   - net::ERR_ABORTED: the page tears down its own parked poll when the
     //     credential changes, rather than leaving a request in flight that was
     //     authorised with a credential nobody holds any more.
-    const IGNORE = ['401 (Unauthorized)', 'net::ERR_ABORTED'];
+    const IGNORE = ['status of 401', 'net::ERR_ABORTED', 'ERR_ABORTED'];
     const noise = (list) => list.filter((l) => !l.includes('favicon') && !IGNORE.some((p) => l.includes(p)));
     const writerNoise = noise(writer.console);
     const readerNoise = noise(reader.console);
@@ -428,6 +491,7 @@ async function main() {
     const del = await fetchJSON(`${BASE}/api/clips/${SFX}`, 'DELETE', {
       headers: { 'X-Clip-Password': PW },
     });
+    failThrottled('DELETE /api/clips', del.status);
     check('cleanup: the test clip was deleted', del.status === 204, `status ${del.status}`);
   } finally {
     try {

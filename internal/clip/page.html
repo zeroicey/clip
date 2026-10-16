@@ -329,9 +329,27 @@ details.meta summary{cursor:pointer}
     autoTimer = setTimeout(function () { autoTimer = null; save(true); }, 900);
   }
 
+  // Every unlock attempt gets a generation, and only the newest one is allowed to
+  // touch the page's state. Two attempts overlap naturally — a double click, or
+  // Enter followed by a click — and without this the LOSING attempt's cleanup
+  // runs after the winner has already succeeded:
+  //
+  //   1. the correct attempt sets password = pw and awaits its response;
+  //   2. the stale attempt's response lands first, and its failure path runs
+  //      `password = storedPw()` — which is still empty, because the winner has
+  //      not stored anything yet — wiping the credential that was just accepted;
+  //   3. the winner's response lands, unlocks the page, and starts polling —
+  //      with the wiped credential, so the poll is refused with 401 and the page
+  //      locks itself again.
+  //
+  // The user sees "unlock worked, then it locked itself", which is exactly the
+  // kind of silent wrong state this project treats as a bug rather than a race.
+  var unlockGen = 0;
+
   async function unlock() {
     var pw = pwInput.value;
     if (!pw) { setStatus(lockStatus, "请输入密码。", "err"); return; }
+    var gen = ++unlockGen;
     setStatus(lockStatus, "解锁中…");
     password = pw;
     try {
@@ -339,12 +357,15 @@ details.meta summary{cursor:pointer}
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password: pw })
       });
+      // A newer attempt owns the page now; this response is history.
+      if (gen !== unlockGen) return;
       if (r.ok && r.json && r.json.data) {
         storePw(pw);
         locked = false;
         writable = true;
         content.hidden = false;
         if (lockbox) lockbox.hidden = true;
+        setStatus(lockStatus, "");
         applyClip(r.json.data);
         paint();
         say("已解锁", "ok");
@@ -359,6 +380,7 @@ details.meta summary{cursor:pointer}
       else if (r.status === 429) setStatus(lockStatus, "试得太频繁了，过一会儿再试。", "err");
       else setStatus(lockStatus, "解锁失败（HTTP " + r.status + "）。", "err");
     } catch (e) {
+      if (gen !== unlockGen) return;
       password = storedPw();
       setStatus(lockStatus, "网络错误，没能解锁。", "err");
     }
