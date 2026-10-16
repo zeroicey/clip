@@ -57,7 +57,8 @@ func New(limit int, window time.Duration) *Limiter {
 	}
 }
 
-// Allow records one attempt for key and reports whether it is within budget.
+// Count records one attempt against key's budget and reports whether it was
+// within budget.
 func (l *Limiter) Allow(key string) bool {
 	if l == nil || l.limit <= 0 {
 		return true
@@ -80,6 +81,37 @@ func (l *Limiter) Allow(key string) bool {
 	b.count++
 	l.buckets[key] = b
 	return true
+}
+
+// Blocked reports whether key has already used up its budget, WITHOUT consuming
+// any of it.
+//
+// It exists so a caller can charge for failures only. A password check must be
+// throttled, but a *correct* password must not consume anything — otherwise a
+// legitimate reader that re-sends its password on every long poll (which is what
+// the clip page does) would eventually throttle itself out. Callers pair it with
+// Allow at the failure site: Blocked to decide whether to do the expensive work
+// at all, Allow to charge the attempt that failed.
+//
+// The pair is deliberately not atomic. A race lets a few extra attempts through
+// under concurrency; that is the right trade for a speed bump — the alternative
+// is making every honest reader pay for the guesser's budget, which fails
+// closed on the wrong party.
+func (l *Limiter) Blocked(key string) bool {
+	if l == nil || l.limit <= 0 {
+		return false
+	}
+	now := l.now()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sweepLocked(now)
+
+	b, ok := l.buckets[key]
+	if !ok || now.Sub(b.start) >= l.window {
+		return false
+	}
+	return b.count >= l.limit
 }
 
 // RetryAfter is an upper bound on how long the caller should wait: the whole

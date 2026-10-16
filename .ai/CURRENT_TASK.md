@@ -1,27 +1,39 @@
 # Current task
 
-**Status:** ✅ **已上线并验证** —— 路由缺陷（HEAD 掉进 NoRoute）已修、已提交、已部署；
-线上 `version` = `13ad95d`（从**干净树**构建，可追溯）。
-**下一步（三份设计已 ✅ 裁决，开始实现第一步）**：定位 = **webnote.cc 的开源版本**。
+**Status:** ✅ **密码功能已实现、已验证，待部署** —— 定位 = **webnote.cc 的开源版本**。
+步骤 ①（密码 + MIT LICENSE + 自动保存）代码已完成：闸门全绿、真库全套绿、
+**真浏览器 42/42**（对本地新代码）。线上仍是 `13ad95d`（无密码那版）。
+步骤 ②（分享链接 `/s/<token>`）未开工。
+**Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-password-and-ownership-handoff.md`
 
-- ✅ `.ai/decisions/2026-10-16-clip-access-password.md` —— 服务端 argon2id 哈希、
-  **挡全部 4 条读路径（含 `/raw`）**、unlock 接口 + `X-Clip-Password` 头、
-  **忘密码不可恢复**、设/改密码要过所有权判定、过期即回收后缀
-- ✅ `.ai/decisions/2026-10-16-clip-open-edit-and-ownership.md` —— **无密码 = 谁都能改**，
-  密码是唯一凭据，**owner_token 整套删掉**（推翻了 AGENTS.md 的旧硬约定）
-- ✅ `.ai/decisions/2026-10-16-clip-share-links.md` —— `/s/<token>` 只读分享；分享密码
-  **与** 6 位取件码都要；分享口令独立于主密码；可撤销 + TTL
+## 步骤 ① 落地了什么（密码 / 归属 / 自动保存 / LICENSE）
 
-**本次确认的其余范围**：LICENSE = **MIT**；自动保存要做。
-用户明确**不要**随机后缀生成（“我本身就需要一个专属我自己的名字…要是给我来个随机后缀，
-我可能就要对着屏幕去敲了”）。
+三份 decision 已 ✅ ACCEPTED 并已实现：
 
-**顺序（用户选的）**：① 密码（含 MIT LICENSE + 自动保存）→ 上线验证 → ② 分享链接。
+- 迁移 `0002_password.sql`：加 `password_hash TEXT`（NULL = 公开），**删 `owner_hash`**；
+  存量行一律 NULL，所以对已有内容是语义中性的。
+- `password.go`：argon2id（19 MiB / t=2 / p=1）的 PHC 哈希与解析；`hashPassword`/`verifyPassword`；
+  长度 4–128。
+- 写权限：**没有 owner token 了**。无密码 = 谁都能写；有密码 = 要密码。
+  判定仍写在写语句的 `WHERE` 里：把「刚校验过的哈希」当 `@proof_hash` 传进去，
+  中途密码被改 → 0 行 → 404（`TestReKeyInvalidatesAnInFlightProof`）。
+- **四条读路径全上锁**（页面 / `/raw` / `/raw/N` / `GET /api/clips/:suffix`）；
+  上锁的页面**不把正文渲进 HTML**。
+- 接口：`POST .../unlock`、`PUT .../password`、`DELETE .../password`；口令走
+  `X-Clip-Password` 头或请求体，**从不进 URL**。
+- 限流：`CLIP_UNLOCK_PER_HOUR`（默认 20），按 `ip:` 与 `suffix:` 两个桶，**只对失败计费**。
+- 页面：解锁壳 + 设/改/去密码 + **防抖自动保存**（webnote 对齐）；密码存 **sessionStorage**（按标签页，
+  `localStorage` 里的凭据已彻底去掉）。
+- **MIT LICENSE** 已加（仓库之前一个 license 文件都没有）。
+- 新增陷阱记录：`.ai/pitfalls/cases/2026-10-16-parked-poll-after-rekey.md`
+  （挂起的长轮询在密码被设上的瞬间会 401，页面必须据此切到锁并**清掉已显示的正文**）。
 
-**本会话在这里结束：设计已锁、代码未写。** 从
-`.ai/sessions/2026-10-16-password-and-ownership-handoff.md` 接着做（里面记了
-两个实现时会撞上的坑：argon2 进不了 SQL 的原子性写法、以及带密码后「不泄漏后缀是否存在」
-这条性质要让位）。“下一会话先做 ①-a：`migrations/0002_*.sql`”。
+**随机后缀生成明确不做**（用户：“我本身就需要一个专属我自己的名字”）。
+
+## 步骤 ② 未开工：分享链接
+
+`.ai/decisions/2026-10-16-clip-share-links.md`（`/s/<token>` 只读、分享密码 **与** 6 位取件码、
+可撤销 + TTL、不复制内容只指向同一份）。`suffix.go` 里 `s`/`k` 早已是保留字。
 
 **Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-clip-split-and-launch-handoff.md`
 

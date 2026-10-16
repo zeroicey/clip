@@ -36,20 +36,34 @@ sqlc generate                    # 改过 internal/clip/queries/*.sql 之后（�
 
 ## 硬约定
 
-- **读是匿名的，写要 owner token。** 创建时服务端返回一次明文 token，只存 `sha256`；
-  更新/删除必须带 `X-Relay-Clip-Token`。判定发生在**任何写入之前**（写在 SQL 的 `WHERE` 里，
-  一次语句完成，没有 read-then-write 竞态）。
-- **后缀是公屏，不是密码。** 短后缀可枚举；知道后缀的人都能读。这条必须出现在面向用户的说明里。
+- **密码是唯一的凭据；没有密码就是公开的。** `password_hash IS NULL` = 任何人可读、可写、可给它设密码；
+  非 NULL = 只有知道密码的人能读、能写、能换密码。**没有 owner token 了**（2026-10-16 废除，
+  见 `.ai/decisions/2026-10-16-clip-open-edit-and-ownership.md`）。密码只存 argon2id 的 PHC 字符串，
+  明文永不入库、永不回显、永不进日志。
+- **写判定必须一次语句完成。** argon2 只能在 Go 里算，但**判定仍然发生在写语句的 `WHERE` 里**：
+  调用方把「刚校验过的那个哈希」当 `@proof_hash` 传进去。中间密码被改过 → 0 行 → 404。
+  **绝不退化成 read-then-write**（那正是要防的竞态）。
+- **密码挡全部 4 条读路径**：页面、`/<后缀>/raw`、`/<后缀>/raw/N`、`GET /api/clips/:suffix`。
+  漏掉任何一条，密码就只是装饰。**上锁的页面绝不把正文渲进 HTML**（渲成壳，解锁后走 API 拉）。
+- **密码口令用 header（`X-Clip-Password`），绝不用 query string 或 URL 路径**——会进访问日志、
+  浏览器历史与 Referer。解锁用 `POST /api/clips/:suffix/unlock`。
+- **忘密码不可恢复**：没有找回流程，只能等过期或换后缀。
+- **无密码的 clip 仍然是公屏**；设了密码才是「不全公开」。面向用户的说明两边都要讲清楚
+  （未设密码时**谁都能改**，且**任何人都能给它设密码把它变成自己的**）。
 - **内容一律按文本渲染**（`textContent`，绝不 `innerHTML`）；CSP 用 per-response nonce，
   不允许 `unsafe-inline`/`unsafe-eval`。作者完全不可信，因为写入口是匿名的。
 - **上传的图片类型从字节嗅探，绝不采信声明**；只允许 PNG/JPEG/GIF/WebP（**不含 SVG**：它是可执行文档）。
 - **未知名后缀的页面返回 200 + 空编辑器**，不是 404 —— 第一次访问的预期动作就是创建。
   代价是页面层不区分「空」与「不存在」，可接受：两者响应体形状完全一致，不泄漏任何东西。
 - **限流键必须用 `clientip.ClientIP`，绝不用任何 RealIP 式实现**（转发头默认可伪造）。
+  解锁失败**同时**按 `ip:<地址>` 与 `suffix:<后缀>` 两个桶计费，且**只对失败计费**
+  （正确的密码永远不消耗预算；否则长轮询会把自己锁死）。桶键必须带前缀，否则 IP 串与后缀
+  可能撞进同一个桶 —— 见 `.ai/pitfalls/cases/2026-10-10-rate-limit-collapsed-to-one-bucket.md`。
 - **时间一律 epoch 毫秒**，`expires_at = 0` 表示永不过期（与 teleport 同一约定）。
 - **响应封套**：`{ok:true,data,requestId}` / `{ok:false,error:{code,message},requestId}`；
   **请求体 camelCase、响应 snake_case** —— 这条跨语言契约有 Go 测试钉住
-  （`TestClientReadsTheFieldNamesTheServerWrites`），因为写错是**静默**的：创建成功但浏览器丢掉写权限。
+  （`TestClientReadsTheFieldNamesTheServerWrites`），因为写错是**静默**的。
+  页面路径（`/`、`/<后缀>`、`/raw`）的错误是 `text/plain`，`/api/*` 一律是封套。
 - **密钥永不入库**：`DATABASE_URL`（含口令）只在 `/data/services/clip/clip.env`（600 root:root）。
 - **部署不在本机**：服务跑在 hpcore（`127.0.0.1:8790`），公网入口是 hcyj 上的 Caddy +
   frp 隧道（hpcore 主动拨出）。**hcyj → hpcore 的入向 TCP 是死的**（见 pitfalls），

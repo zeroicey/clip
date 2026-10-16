@@ -79,37 +79,114 @@ func envelope(t *testing.T, w *httptest.ResponseRecorder) (bool, map[string]any,
 	return parsed.OK, parsed.Data, parsed.Error
 }
 
-func TestCreateReturnsTheOwnerTokenExactlyOnce(t *testing.T) {
+// TestCreateWithPasswordIsProtectedFromTheFirstByte pins the reason a password
+// may be supplied at creation: creating first and protecting second would leave
+// a window in which the content is readable by anyone, while the user believes
+// they made it private.
+func TestCreateWithPasswordIsProtectedFromTheFirstByte(t *testing.T) {
 	r := testServer(t)
 
-	w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "hello"}, nil)
+	w := do(t, r, "PUT", "/api/clips/ops1",
+		map[string]any{"body": "secret plans", "password": "s3cret"}, nil)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("create = %d, want 201 (%s)", w.Code, w.Body.String())
 	}
-	okFlag, data, _ := envelope(t, w)
-	if !okFlag {
-		t.Fatal("create did not report ok")
+	bodyText := w.Body.String()
+	_, data, _ := envelope(t, w)
+	if data["has_password"] != true {
+		t.Fatalf("has_password = %v, want true", data["has_password"])
 	}
-	token, _ := data["owner_token"].(string)
-	if len(token) < 40 {
-		t.Fatalf("owner_token = %q, want a 256-bit token", token)
+	// The credential must not be echoed back in any form — not the plaintext, and
+	// not the stored hash (which is the thing an offline attack would work on).
+	if _, present := data["password"]; present {
+		t.Error("the create response echoed the password")
 	}
-	if data["exists"] != true {
-		t.Errorf("create response says exists=%v, want true", data["exists"])
+	if strings.Contains(bodyText, "argon2id") {
+		t.Error("a response carried the stored password hash")
 	}
 
-	// Read back: the token must NOT be in a normal read, or the credential
-	// would be handed to anyone who can reach the URL.
+	// Without the password: refused, and the refusal does not contain the body.
 	w = do(t, r, "GET", "/api/clips/ops1", nil, nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("read without a password = %d, want 401 (%s)", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "secret plans") {
+		t.Fatal("a refused read leaked the body")
+	}
+	_, _, errBody := envelope(t, w)
+	if errBody["code"] != "password_required" {
+		t.Errorf("error code = %v, want password_required", errBody["code"])
+	}
+
+	// With it: the content, and still no hash on the wire.
+	w = do(t, r, "GET", "/api/clips/ops1", nil, map[string]string{"X-Clip-Password": "s3cret"})
 	if w.Code != http.StatusOK {
-		t.Fatalf("get = %d", w.Code)
+		t.Fatalf("read with the password = %d (%s)", w.Code, w.Body.String())
 	}
 	_, data, _ = envelope(t, w)
-	if _, present := data["owner_token"]; present {
-		t.Fatal("a read response disclosed the owner token")
+	if data["body"] != "secret plans" {
+		t.Fatalf("body = %v", data["body"])
 	}
-	if data["body"] != "hello" {
-		t.Errorf("body = %v", data["body"])
+	if strings.Contains(w.Body.String(), "argon2id") {
+		t.Error("an authorised read carried the stored password hash")
+	}
+}
+
+// TestPublicClipIsOverwrittenByAnyoneAtTheAPI is the inverse of what this
+// endpoint used to assert, and it is asserted explicitly because the change was
+// deliberate rather than incidental: with no password there is nothing to
+// present, so anyone who knows the suffix may write. A regression to the old
+// owner-token behaviour would otherwise surface as "saving is broken".
+func TestPublicClipIsOverwrittenByAnyoneAtTheAPI(t *testing.T) {
+	r := testServer(t)
+	if w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "first"}, nil); w.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", w.Code, w.Body.String())
+	}
+
+	w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "second"}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("a credential-free overwrite of a public clip = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	_, data, _ := envelope(t, w)
+	if data["body"] != "second" || data["rev"].(float64) != 2 {
+		t.Fatalf("after the overwrite: body=%v rev=%v", data["body"], data["rev"])
+	}
+}
+
+// TestProtectedClipRefusesWritesWithoutThePassword is the boundary that remains
+// once a password is set — and it asserts the body did NOT change, because
+// "the call failed" and "nothing was written" are different claims.
+func TestProtectedClipRefusesWritesWithoutThePassword(t *testing.T) {
+	r := testServer(t)
+	if w := do(t, r, "PUT", "/api/clips/ops1",
+		map[string]any{"body": "original", "password": "s3cret"}, nil); w.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", w.Code, w.Body.String())
+	}
+
+	for _, hdrs := range []map[string]string{nil, {"X-Clip-Password": "wrong"}} {
+		w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "defaced"}, hdrs)
+		if w.Code == http.StatusOK || w.Code == http.StatusCreated {
+			t.Fatalf("a write without the password was accepted: %d %s", w.Code, w.Body.String())
+		}
+	}
+
+	// Nothing was written.
+	w := do(t, r, "GET", "/api/clips/ops1", nil, map[string]string{"X-Clip-Password": "s3cret"})
+	_, data, _ := envelope(t, w)
+	if data["body"] != "original" {
+		t.Fatalf("a refused write changed the body: %v", data["body"])
+	}
+
+	// With the password it goes through — otherwise the assertions above would
+	// pass for the wrong reason.
+	w = do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "the real update"},
+		map[string]string{"X-Clip-Password": "s3cret"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("write with the password = %d (%s)", w.Code, w.Body.String())
+	}
+	_, data, _ = envelope(t, w)
+	if data["body"] != "the real update" || data["rev"].(float64) != 2 {
+		t.Fatalf("after the authorised write: body=%v rev=%v", data["body"], data["rev"])
 	}
 }
 
@@ -128,44 +205,16 @@ func TestGetUnknownSuffixIsAnEmptyEditorNotAnError(t *testing.T) {
 	}
 }
 
-// TestUpdateWithoutATokenIsRefusedAndDoesNotLeak distinguishes the two failure
-// modes on purpose: without any token the answer is 409 "taken" (which the
-// person needs, to learn the suffix is in use), and with a *wrong* token it is
-// 409 as well — but never a silent overwrite.
+// TestUpdateWithoutATokenIsRefusedAndDoesNotLeak
+//
+// (The name is kept for continuity with the incidents it documents: an update
+// with NO credential used to be refused, because a guessed suffix was readable
+// but not writable. Under the model adopted on 2026-10-16 that is no longer
+// true for a public clip — see TestPublicClipIsOverwrittenByAnyoneAtTheAPI — and
+// the remaining boundary is the password, covered by
+// TestProtectedClipRefusesWritesWithoutThePassword.)
 func TestUpdateWithoutATokenIsRefusedAndDoesNotLeak(t *testing.T) {
-	r := testServer(t)
-	w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "first"}, nil)
-	_, data, _ := envelope(t, w)
-	token := data["owner_token"].(string)
-
-	w = do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "overwrite attempt"}, nil)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("tokenless overwrite = %d, want 409 (%s)", w.Code, w.Body.String())
-	}
-	_, _, errBody := envelope(t, w)
-	if errBody["code"] != "suffix_taken" {
-		t.Errorf("error code = %v, want suffix_taken", errBody["code"])
-	}
-
-	w = do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "wrong token attempt"},
-		map[string]string{"X-Relay-Clip-Token": "not-the-token"})
-	if w.Code == http.StatusOK || w.Code == http.StatusCreated {
-		t.Fatalf("a wrong token was accepted: %d %s", w.Code, w.Body.String())
-	}
-
-	// The owner's token still works, and the content is the original.
-	w = do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "the real update"},
-		map[string]string{"X-Relay-Clip-Token": token})
-	if w.Code != http.StatusOK {
-		t.Fatalf("owner update = %d, want 200 (%s)", w.Code, w.Body.String())
-	}
-	_, data, _ = envelope(t, w)
-	if data["body"] != "the real update" {
-		t.Fatalf("body = %v", data["body"])
-	}
-	if data["rev"].(float64) != 2 {
-		t.Errorf("rev = %v, want 2", data["rev"])
-	}
+	t.Skip("superseded by TestPublicClipIsOverwrittenByAnyoneAtTheAPI and TestProtectedClipRefusesWritesWithoutThePassword")
 }
 
 func TestWriteValidation(t *testing.T) {
@@ -249,38 +298,48 @@ func TestRateLimitAppliesToWritesOnly(t *testing.T) {
 
 func TestDelete(t *testing.T) {
 	r := testServer(t)
-	w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "x"}, nil)
-	_, data, _ := envelope(t, w)
-	token := data["owner_token"].(string)
 
-	if w := do(t, r, "DELETE", "/api/clips/ops1", nil, nil); w.Code != http.StatusUnauthorized {
-		t.Fatalf("delete without a token = %d, want 401", w.Code)
+	// A public clip: anyone who can reach it may delete it. Same rule as writing
+	// to it — with no password there is no credential to withhold.
+	if w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "x"}, nil); w.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", w.Code, w.Body.String())
 	}
-	if w := do(t, r, "DELETE", "/api/clips/ops1", nil,
-		map[string]string{"X-Relay-Clip-Token": "wrong"}); w.Code != http.StatusNotFound {
-		t.Fatalf("delete with a wrong token = %d, want 404", w.Code)
+	if w := do(t, r, "DELETE", "/api/clips/ops1", nil, nil); w.Code != http.StatusNoContent {
+		t.Fatalf("delete of a public clip = %d, want 204 (%s)", w.Code, w.Body.String())
 	}
-	if w := do(t, r, "DELETE", "/api/clips/ops1", nil,
-		map[string]string{"X-Relay-Clip-Token": token}); w.Code != http.StatusNoContent {
-		t.Fatalf("delete as the owner = %d, want 204 (%s)", w.Code, w.Body.String())
-	}
-	_, data, _ = envelope(t, do(t, r, "GET", "/api/clips/ops1", nil, nil))
+	_, data, _ := envelope(t, do(t, r, "GET", "/api/clips/ops1", nil, nil))
 	if data["exists"] != false {
 		t.Fatal("the clip is still there after a successful delete")
+	}
+
+	// A protected one: the password is required, and a wrong one is a 404 — not
+	// a 403, which would confirm the clip exists to someone who cannot read it.
+	if w := do(t, r, "PUT", "/api/clips/ops2",
+		map[string]any{"body": "private", "password": "s3cret"}, nil); w.Code != http.StatusCreated {
+		t.Fatalf("create protected = %d (%s)", w.Code, w.Body.String())
+	}
+	for _, hdrs := range []map[string]string{nil, {"X-Clip-Password": "wrong"}} {
+		if w := do(t, r, "DELETE", "/api/clips/ops2", nil, hdrs); w.Code != http.StatusUnauthorized && w.Code != http.StatusNotFound {
+			t.Fatalf("delete of a protected clip without the password = %d, want 401/404", w.Code)
+		}
+	}
+	if w := do(t, r, "DELETE", "/api/clips/ops2", nil,
+		map[string]string{"X-Clip-Password": "s3cret"}); w.Code != http.StatusNoContent {
+		t.Fatalf("delete with the password = %d, want 204 (%s)", w.Code, w.Body.String())
 	}
 }
 
 func TestAssetUploadAndServing(t *testing.T) {
 	r := testServer(t)
-	w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "with a picture"}, nil)
-	_, data, _ := envelope(t, w)
-	token := data["owner_token"].(string)
+	if w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "with a picture"}, nil); w.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", w.Code, w.Body.String())
+	}
 
-	w = upload(t, r, "ops1", token, map[string][]byte{"shot.png": pngBytes()})
+	w := upload(t, r, "ops1", "", map[string][]byte{"shot.png": pngBytes()})
 	if w.Code != http.StatusOK {
 		t.Fatalf("upload = %d, want 200 (%s)", w.Code, w.Body.String())
 	}
-	_, data, _ = envelope(t, w)
+	_, data, _ := envelope(t, w)
 	assets, _ := data["assets"].([]any)
 	if len(assets) != 1 {
 		t.Fatalf("assets = %v, want one", data["assets"])
@@ -311,42 +370,58 @@ func TestAssetUploadAndServing(t *testing.T) {
 // anything the client said.
 func TestUploadRejectsNonImages(t *testing.T) {
 	r := testServer(t)
-	w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "x"}, nil)
-	_, data, _ := envelope(t, w)
-	token := data["owner_token"].(string)
+	if w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "x"}, nil); w.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", w.Code, w.Body.String())
+	}
 
 	for name, payload := range map[string][]byte{
 		"evil.png":  []byte("<html><script>alert(1)</script></html>"),
 		"evil.svg":  []byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`),
 		"empty.png": {},
 	} {
-		w := upload(t, r, "ops1", token, map[string][]byte{name: payload})
+		w := upload(t, r, "ops1", "", map[string][]byte{name: payload})
 		if w.Code != http.StatusBadRequest && w.Code != http.StatusRequestEntityTooLarge {
 			t.Errorf("uploading %s = %d, want 400 (%s)", name, w.Code, w.Body.String())
 		}
 	}
 	// Nothing was written by any of the refused uploads.
-	_, data, _ = envelope(t, do(t, r, "GET", "/api/clips/ops1", nil, nil))
+	_, data, _ := envelope(t, do(t, r, "GET", "/api/clips/ops1", nil, nil))
 	if assets, ok := data["assets"].([]any); ok && len(assets) != 0 {
 		t.Fatalf("a refused upload still stored %d asset(s)", len(assets))
 	}
 }
 
-func TestUploadRequiresTheOwnerToken(t *testing.T) {
+// TestUploadRequiresThePassword: the image route is behind the same password as
+// the text. A public clip accepts a credential-free upload (there is nothing to
+// present), a protected one does not — and the wrong-password case must not
+// store anything.
+func TestUploadRequiresThePassword(t *testing.T) {
 	r := testServer(t)
-	do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "x"}, nil)
-
-	w := upload(t, r, "ops1", "wrong-token", map[string][]byte{"shot.png": pngBytes()})
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("upload with a wrong token = %d, want 404", w.Code)
+	if w := do(t, r, "PUT", "/api/clips/ops1",
+		map[string]any{"body": "x", "password": "s3cret"}, nil); w.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", w.Code, w.Body.String())
 	}
-	w = upload(t, r, "ops1", "", map[string][]byte{"shot.png": pngBytes()})
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("upload with no token = %d, want 401", w.Code)
+
+	for _, pw := range []string{"wrong", ""} {
+		w := upload(t, r, "ops1", pw, map[string][]byte{"shot.png": pngBytes()})
+		if w.Code == http.StatusOK {
+			t.Fatalf("upload with password %q = %d, want a refusal", pw, w.Code)
+		}
+	}
+	// And nothing was stored by either attempt.
+	w := do(t, r, "GET", "/api/clips/ops1", nil, map[string]string{"X-Clip-Password": "s3cret"})
+	_, data, _ := envelope(t, w)
+	if assets, ok := data["assets"].([]any); ok && len(assets) != 0 {
+		t.Fatalf("a refused upload stored %d asset(s)", len(assets))
+	}
+
+	// With the password it lands.
+	if w := upload(t, r, "ops1", "s3cret", map[string][]byte{"shot.png": pngBytes()}); w.Code != http.StatusOK {
+		t.Fatalf("upload with the password = %d, want 200 (%s)", w.Code, w.Body.String())
 	}
 }
 
-func upload(t *testing.T, r *gin.Engine, suffix, token string, files map[string][]byte) *httptest.ResponseRecorder {
+func upload(t *testing.T, r *gin.Engine, suffix, password string, files map[string][]byte) *httptest.ResponseRecorder {
 	t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -364,8 +439,8 @@ func upload(t *testing.T, r *gin.Engine, suffix, token string, files map[string]
 	}
 	req := httptest.NewRequest("POST", "/api/clips/"+suffix+"/assets", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	if token != "" {
-		req.Header.Set("X-Relay-Clip-Token", token)
+	if password != "" {
+		req.Header.Set("X-Clip-Password", password)
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -550,9 +625,9 @@ func TestLongPollReturnsImmediatelyWhenBehind(t *testing.T) {
 
 func TestLongPollWakesOnWrite(t *testing.T) {
 	r := testServer(t)
-	w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "first"}, nil)
-	_, data, _ := envelope(t, w)
-	token := data["owner_token"].(string)
+	if w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "first"}, nil); w.Code != http.StatusCreated {
+		t.Fatalf("create = %d (%s)", w.Code, w.Body.String())
+	}
 
 	done := make(chan int64, 1)
 	go func() {
@@ -568,8 +643,7 @@ func TestLongPollWakesOnWrite(t *testing.T) {
 	// a missed wake-up would still be answered with the current revision on the
 	// poll's next iteration — but it makes the wake-up path the likely one.
 	time.Sleep(150 * time.Millisecond)
-	do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "second"},
-		map[string]string{"X-Relay-Clip-Token": token})
+	do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "second"}, nil)
 
 	select {
 	case rev := <-done:

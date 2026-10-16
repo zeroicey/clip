@@ -39,3 +39,11 @@ else if (r.status === 201) { say("创建成功了，但没有拿到写权限（�
 「跨语言字符串契约必须有消费方视角的测试」那条。
 
 同类教训：`.ai/pitfalls/cases/csp-blocks-the-assets-the-page-links.md`（页面通过检查但功能已死）。
+
+## 后续（2026-10-16）：例子里的字段名变了，教训没变
+
+owner token 已被密码取代（`.ai/decisions/2026-10-16-clip-open-edit-and-ownership.md`），
+所以 `owner_token` 不再是响应字段。**这条陷阱本身完全不变**，只是受它保护的字段换成了
+`has_password` / `locked`，并且多了一半：页面还必须发对 **`X-Clip-Password` 头**，
+否则带密码的 clip 永远读不出来（同样是静默的）。守卫
+`TestClientReadsTheFieldNamesTheServerWrites` 现在同时钉住这三件事。

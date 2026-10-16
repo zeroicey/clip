@@ -62,7 +62,7 @@ button,label.file{
 }
 button:hover,label.file:hover{border-color:var(--accent)}
 button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
-button[hidden],label[hidden]{display:none}
+button[hidden],label[hidden],div[hidden],section[hidden]{display:none}
 button:disabled{opacity:.5;cursor:default}
 .status{margin:0;font-size:13.5px;color:var(--muted);min-height:1.4em}
 .status[data-tone=err]{color:var(--err)}
@@ -87,6 +87,12 @@ details.meta summary{cursor:pointer}
   font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 .note{color:var(--warn)}
+.lockbox{
+  border:1px solid var(--line);border-radius:10px;background:var(--card);
+  padding:16px;display:flex;flex-direction:column;gap:12px;
+}
+#lockbox input[type=password]{flex:1;min-width:220px;padding:9px 11px;border:1px solid var(--line);
+  border-radius:8px;background:var(--card);color:var(--fg);font:15px/1.5 inherit}
 @media (max-width:520px){ header{padding:12px} main{padding:12px} }
 </style>
 </head>
@@ -98,6 +104,7 @@ details.meta summary{cursor:pointer}
   data-base="{{.Base}}"
   data-expires="{{.ExpiresText}}"
   data-max-asset="{{.MaxAssetText}}"
+  data-has-password="{{.HasPassword}}"
   data-can-write="{{.CanWrite}}">
 
 <header>
@@ -108,34 +115,51 @@ details.meta summary{cursor:pointer}
 <main>
   <p class="hint" id="hint">{{.Hint}}</p>
 
-  <textarea id="body" spellcheck="false" autocapitalize="off" autocomplete="off"
-    aria-label="剪贴板内容"{{if not .Editable}} readonly{{end}}>{{.Body}}</textarea>
+  <section class="lockbox" id="lockbox"{{if not .Locked}} hidden{{end}}>
+    <p class="hint">这个剪贴板设了密码 —— 输入密码才能看到内容。内容没有随这个页面下发，
+      所以未解锁时它不在浏览器的任何地方。</p>
+    <div class="row">
+      <input type="password" id="pw" autocomplete="current-password"
+        aria-label="访问密码" placeholder="访问密码">
+      <button class="primary" id="unlock" type="button">解锁</button>
+    </div>
+    <p class="status" id="lockstatus" role="status" aria-live="polite"></p>
+  </section>
 
-  <div class="thumbs" id="thumbs">{{range .Assets}}<figure><a href="{{$.Base}}/{{$.Suffix}}/raw/{{.Position}}" target="_blank" rel="noopener"><img src="{{$.Base}}/{{$.Suffix}}/raw/{{.Position}}" alt="图片 {{.Position}}"></a></figure>{{end}}</div>
+  <div id="content"{{if .Locked}} hidden{{end}}>
+    <textarea id="body" spellcheck="false" autocapitalize="off" autocomplete="off"
+      aria-label="剪贴板内容"{{if not .Editable}} readonly{{end}}>{{.Body}}</textarea>
 
-  <div class="row" id="actions">
-    <button class="primary" id="save" hidden>保存</button>
-    <label class="file" id="addimg" hidden>加图片<input type="file" id="files" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden></label>
-    <button id="copy">复制全文</button>
-    <button id="del" hidden>删除</button>
+    <div class="thumbs" id="thumbs">{{range .Assets}}<figure><a href="{{$.Base}}/{{$.Suffix}}/raw/{{.Position}}" target="_blank" rel="noopener"><img src="{{$.Base}}/{{$.Suffix}}/raw/{{.Position}}" alt="图片 {{.Position}}"></a></figure>{{end}}</div>
+
+    <div class="row" id="actions">
+      <button class="primary" id="save" hidden>保存</button>
+      <label class="file" id="addimg" hidden>加图片<input type="file" id="files" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden></label>
+      <button id="copy">复制全文</button>
+      <button id="del" hidden>删除</button>
+    </div>
+
+    <p class="status" id="status" role="status" aria-live="polite"></p>
   </div>
-
-  <p class="status" id="status" role="status" aria-live="polite"></p>
 
   <details class="meta">
     <summary>详细</summary>
     <dl>
       <dt>版本</dt><dd id="rev">{{.Rev}}</dd>
       <dt>过期</dt><dd id="exp">{{.ExpiresText}}</dd>
+      <dt>密码</dt><dd id="pwstate">{{.PasswordState}}</dd>
       <dt>纯文本</dt><dd><a href="{{.Base}}/{{.Suffix}}/raw">{{.Base}}/{{.Suffix}}/raw</a></dd>
-      <dt>编辑钥匙</dt><dd id="keystate">{{.KeyState}}</dd>
     </dl>
     <div class="keybox">
-      <button id="genkey" type="button">显示编辑钥匙链接</button>
-      <input id="keyurl" type="text" readonly hidden aria-label="编辑钥匙链接">
-      <button id="copykey" type="button" hidden>复制</button>
+      <input type="password" id="newpw" autocomplete="new-password"
+        aria-label="新密码" placeholder="新密码（至少 4 个字符）">
+      <button id="setpw" type="button">设置 / 修改密码</button>
+      <button id="clearpw" type="button">去掉密码</button>
     </div>
-    <p class="meta note" id="keynote" hidden>这条链接里的人带着写权限，等于密码：发之前想一秒。<br>用 <code>curl</code> 读这份内容是 <code>curl {{.Base}}/{{.Suffix}}/raw</code></p>
+    <p class="meta note" id="pwnote">密码只存 argon2id 哈希，<b>忘了找不回来</b> —— 没有找回流程，
+      只能等它过期（或换一个后缀重来）。<br>
+      没设密码时，知道这个网址的人<b>都能读、也都能改</b>，任何人都能给它设一个密码把它变成自己的。<br>
+      命令行读带密码的内容：<code>curl -H 'X-Clip-Password: 密码' {{.Base}}/{{.Suffix}}/raw</code></p>
   </details>
 </main>
 
@@ -146,11 +170,13 @@ details.meta summary{cursor:pointer}
   var suffix = root.dataset.suffix;
   var base = root.dataset.base;
   var rev = parseInt(root.dataset.rev, 10) || 0;
-  var exists = root.dataset.state === "existing";
+  var state = root.dataset.state;
+  var exists = state !== "new";
+  var locked = state === "locked";
   var canWrite = root.dataset.canWrite === "true";
+  var hasPassword = root.dataset.hasPassword === "true";
 
   var body = document.getElementById("body");
-  var hint = document.getElementById("hint");
   var status = document.getElementById("status");
   var saveBtn = document.getElementById("save");
   var delBtn = document.getElementById("del");
@@ -159,35 +185,49 @@ details.meta summary{cursor:pointer}
   var thumbs = document.getElementById("thumbs");
   var revEl = document.getElementById("rev");
   var expEl = document.getElementById("exp");
-  var keyState = document.getElementById("keystate");
+  var content = document.getElementById("content");
+  var lockbox = document.getElementById("lockbox");
+  var lockStatus = document.getElementById("lockstatus");
+  var pwInput = document.getElementById("pw");
+  var newPw = document.getElementById("newpw");
+  var pwState = document.getElementById("pwstate");
 
-  var PREFIX = "relay.clip.";
-  // Declared before the handlers that stop it: `polling` is read by the poll
-  // loop, which only runs once the clip exists.
+  var PREFIX = "relay.clip.pw.";
+  // sessionStorage, not localStorage, and deliberately: the password belongs to
+  // THIS tab's session. Two tabs of one browser sharing it is exactly what used
+  // to make "two tabs" behave like one machine and break the read/write
+  // separation this page is supposed to demonstrate
+  // (.ai/pitfalls/cases/two-tabs-are-not-two-machines.md).
+  function storedPw() { try { return sessionStorage.getItem(PREFIX + suffix) || ""; } catch (e) { return ""; } }
+  function storePw(p) {
+    try { if (p) sessionStorage.setItem(PREFIX + suffix, p); else sessionStorage.removeItem(PREFIX + suffix); } catch (e) {}
+  }
+
+  var password = storedPw();
+  // Readable once unlocked; writable when the server says so (which is "always"
+  // for a clip with no password, since that is the documented model).
+  var writable = canWrite && !locked;
+  var lastLoaded = body.value;
   var polling = false;
+  var autoTimer = null;
+  // Every poll gets a generation, and a new generation retires the old loop.
+  // Without it, restarting the poll (which has to happen whenever the password
+  // changes) leaves the previous loop alive and two loops then fight over the
+  // textarea.
+  var pollGen = 0;
+  var pollCtl = null;
 
-  function stored() { try { return localStorage.getItem(PREFIX + suffix) || ""; } catch (e) { return ""; } }
-  function store(t) { try { localStorage.setItem(PREFIX + suffix, t); } catch (e) {} }
+  function say(msg, tone) { setStatus(status, msg, tone); }
+  function setStatus(el, msg, tone) {
+    if (!el) return;
+    el.textContent = msg || "";
+    if (tone) el.setAttribute("data-tone", tone); else el.removeAttribute("data-tone");
+  }
 
-  // The edit key can arrive in the URL fragment. A fragment is never sent to the
-  // server (it stays out of access logs and Referer), which is why the key is
-  // carried there rather than in a query parameter — the same reasoning the
-  // one-step key hand-off in teleport uses. It is adopted and then removed from
-  // the address bar so a screenshot or a shared screen does not leak it.
-  (function adoptFragment() {
-    var h = location.hash;
-    if (h.indexOf("#k=") === 0 && h.length > 3) {
-      store(decodeURIComponent(h.slice(3)));
-      try { history.replaceState(null, "", location.pathname); } catch (e) {}
-    }
-  })();
-
-  var token = stored();
-  var writable = canWrite || !!token;
-
-  function say(msg, tone) {
-    status.textContent = msg || "";
-    if (tone) status.setAttribute("data-tone", tone); else status.removeAttribute("data-tone");
+  function authHeaders(extra) {
+    var h = extra || {};
+    if (password) h["X-Clip-Password"] = password;
+    return h;
   }
 
   function paint() {
@@ -197,18 +237,19 @@ details.meta summary{cursor:pointer}
     saveBtn.hidden = !writable;
     addImg.hidden = !writable;
     delBtn.hidden = !writable || !exists;
-    keyState.textContent = token ? (exists ? "这台浏览器有写权限" : "创建时自动生成") : "无（只能读）";
+    if (locked) return;
+    pwState.textContent = hasPassword ? "已设密码（本标签页已解锁）" : "未设密码（谁都能读、谁都能改）";
   }
 
   function dirty() { return writable && body.value !== lastLoaded; }
-  var lastLoaded = body.value;
 
   async function api(method, path, opts) {
     opts = opts || {};
     var res = await fetch(base + path, {
       method: method,
-      headers: opts.headers || {},
+      headers: authHeaders(opts.headers || {}),
       body: opts.body,
+      signal: opts.signal,
       cache: "no-store",
       credentials: "same-origin",
       redirect: "error"
@@ -222,10 +263,8 @@ details.meta summary{cursor:pointer}
   function applyClip(data) {
     if (typeof data.rev === "number") { rev = data.rev; revEl.textContent = String(rev); }
     if (typeof data.exists === "boolean") exists = data.exists;
-    if (typeof data.body === "string") {
-      body.value = data.body;
-      lastLoaded = data.body;
-    }
+    if (typeof data.has_password === "boolean") hasPassword = data.has_password;
+    if (typeof data.body === "string") { body.value = data.body; lastLoaded = data.body; }
     if (typeof data.expires_at === "number") expEl.textContent = data.expires_text || expEl.textContent;
     if (Array.isArray(data.assets)) {
       thumbs.textContent = "";
@@ -236,6 +275,9 @@ details.meta summary{cursor:pointer}
         link.target = "_blank";
         link.rel = "noopener";
         var img = document.createElement("img");
+        // The URL is built here rather than taken from the response, and the
+        // node is created with DOM calls, never innerHTML: the author of a clip
+        // is an unauthenticated stranger.
         img.src = link.href;
         img.alt = "图片 " + a.position;
         link.appendChild(img);
@@ -245,37 +287,28 @@ details.meta summary{cursor:pointer}
     }
   }
 
-  async function save() {
+  // autosave distinguishes "the user asked" from "we did it for them", so the
+  // status line never claims a deliberate save that did not happen.
+  async function save(autosave) {
+    if (!writable) return;
     saveBtn.disabled = true;
-    say("保存中…");
+    say(autosave ? "自动保存中…" : "保存中…");
     var payload = JSON.stringify({ body: body.value });
     var headers = { "Content-Type": "application/json" };
-    if (token) headers["X-Relay-Clip-Token"] = token;
     try {
       var r = await api("PUT", "/api/clips/" + encodeURIComponent(suffix), { headers: headers, body: payload });
-      // Field names come from the wire, not from Go: requests are camelCase
-      // (`expiresInHours`) and responses are snake_case (`owner_token`,
-      // `expires_at`). Getting this backwards is silent — the create succeeds,
-      // nothing is stored, and the browser quietly loses write access to the
-      // clip it just made.
-      if (r.status === 201 && r.json && r.json.data && r.json.data.owner_token) {
-        token = r.json.data.owner_token;
-        store(token);
-        writable = true;
+      // Field names come from the wire, not from Go: requests are camelCase and
+      // responses are snake_case. Getting it backwards is silent, which is why a
+      // contract test pins both halves.
+      if (r.ok) {
         exists = true;
-        say("已创建并保存（这台浏览器记住了写权限）", "ok");
-      } else if (r.status === 201) {
-        // Created but no credential came back. That is a contract bug, not a
-        // user error: fail loudly rather than pretending the save worked and
-        // leaving this browser unable to write to its own clip.
-        say("创建成功了，但没有拿到写权限（这是 bug，请刷新页面重试并反馈）。", "err");
-      } else if (r.ok) {
-        exists = true;
-        say("已保存", "ok");
+        say(autosave ? "已自动保存" : "已保存", "ok");
       } else if (r.status === 409) {
-        say("这个后缀已经被别人占了。换一个后缀，或者用编辑钥匙链接打开。", "err");
+        say("这个后缀已经被别人占了。换一个后缀。", "err");
       } else if (r.status === 429) {
         say("写得太频繁了，歇一会儿再试。", "err");
+      } else if (r.status === 401) {
+        say("需要密码才能改这份剪贴板。", "err");
       } else {
         var m = r.json && r.json.error ? r.json.error.message : "保存失败（HTTP " + r.status + "）";
         say(m, "err");
@@ -290,19 +323,140 @@ details.meta summary{cursor:pointer}
     }
   }
 
+  function scheduleAutosave() {
+    if (!writable) return;
+    if (autoTimer) clearTimeout(autoTimer);
+    autoTimer = setTimeout(function () { autoTimer = null; save(true); }, 900);
+  }
+
+  async function unlock() {
+    var pw = pwInput.value;
+    if (!pw) { setStatus(lockStatus, "请输入密码。", "err"); return; }
+    setStatus(lockStatus, "解锁中…");
+    password = pw;
+    try {
+      var r = await api("POST", "/api/clips/" + encodeURIComponent(suffix) + "/unlock", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: pw })
+      });
+      if (r.ok && r.json && r.json.data) {
+        storePw(pw);
+        locked = false;
+        writable = true;
+        content.hidden = false;
+        if (lockbox) lockbox.hidden = true;
+        applyClip(r.json.data);
+        paint();
+        say("已解锁", "ok");
+        startPolling();
+        return;
+      }
+      // Wrong password and "no password" are told apart on purpose: the server
+      // says which, and neither answer reveals anything the page had not already
+      // revealed by asking at all.
+      password = storedPw();
+      if (r.status === 401) setStatus(lockStatus, "密码不对。", "err");
+      else if (r.status === 429) setStatus(lockStatus, "试得太频繁了，过一会儿再试。", "err");
+      else setStatus(lockStatus, "解锁失败（HTTP " + r.status + "）。", "err");
+    } catch (e) {
+      password = storedPw();
+      setStatus(lockStatus, "网络错误，没能解锁。", "err");
+    }
+  }
+
+  // enterLocked is what a page does when it learns it may no longer read the
+  // clip: most often because another tab (or another person) set a password
+  // while this page was watching.
+  //
+  // The content is CLEARED, not just hidden behind a prompt. Someone who was
+  // already looking at the text has seen it, but a page that keeps rendering it
+  // after the clip became private would be showing a locked clip's contents to
+  // whoever walks past the screen.
+  function enterLocked(msg) {
+    locked = true;
+    writable = false;
+    polling = false;
+    pollGen++;
+    abortPoll();
+    password = "";
+    storePw("");
+    body.value = "";
+    lastLoaded = "";
+    thumbs.textContent = "";
+    content.hidden = true;
+    if (lockbox) lockbox.hidden = false;
+    paint();
+    setStatus(lockStatus, msg || "这份剪贴板现在需要密码了。", "err");
+  }
+
+  function abortPoll() {
+    if (pollCtl) {
+      try { pollCtl.abort(); } catch (e) { /* already finished */ }
+      pollCtl = null;
+    }
+  }
+
+  // restartPolling retires the current poll and starts a fresh one. It is called
+  // whenever the credential changes: the request that is parked on the server
+  // was authorised with the OLD credential, and the server re-checks on wake-up,
+  // so leaving it in place would produce a 401 for a request nobody cares about
+  // any more.
+  function restartPolling() {
+    if (!exists || locked) return;
+    abortPoll();
+    polling = false;
+    pollGen++;
+    startPolling();
+  }
+
+  async function setPassword() {
+    var pw = newPw.value;
+    if (!pw) { say("先在上面填一个密码。", "err"); return; }
+    var r = await api("PUT", "/api/clips/" + encodeURIComponent(suffix) + "/password", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: pw })
+    });
+    if (r.ok && r.json && r.json.data) {
+      password = pw;
+      storePw(pw);
+      newPw.value = "";
+      hasPassword = true;
+      applyClip(r.json.data);
+      paint();
+      say("已设密码。这台标签页记住了它，别的设备打开要输入。", "ok");
+      restartPolling();
+      return;
+    }
+    say(r.json && r.json.error ? r.json.error.message : "设置失败（HTTP " + r.status + "）。", "err");
+  }
+
+  async function clearPassword() {
+    if (!confirm("去掉密码？去掉之后知道这个网址的人都能读、都能改。")) return;
+    var r = await api("DELETE", "/api/clips/" + encodeURIComponent(suffix) + "/password");
+    if (r.ok && r.json && r.json.data) {
+      password = "";
+      storePw("");
+      hasPassword = false;
+      applyClip(r.json.data);
+      paint();
+      say("已去掉密码，这份剪贴板现在是公开的。", "ok");
+      restartPolling();
+      return;
+    }
+    say(r.json && r.json.error ? r.json.error.message : "取消失败（HTTP " + r.status + "）。", "err");
+  }
+
   async function upload(list) {
     if (!list || !list.length) return;
-    if (!token) { say("没有写权限，无法上传图片。", "err"); return; }
+    if (!writable) { say("没有写权限，无法上传图片。", "err"); return; }
     var fd = new FormData();
     for (var i = 0; i < list.length; i++) fd.append("images", list[i]);
     say("上传中…");
     try {
-      var r = await api("POST", "/api/clips/" + encodeURIComponent(suffix) + "/assets", {
-        headers: { "X-Relay-Clip-Token": token },
-        body: fd
-      });
+      var r = await api("POST", "/api/clips/" + encodeURIComponent(suffix) + "/assets", { body: fd });
       if (r.ok) { say("图片已上传", "ok"); if (r.json && r.json.data) applyClip(r.json.data); }
-      else if (r.status === 404) say("没有写权限，或这份剪贴板已经过期。", "err");
+      else if (r.status === 404) say("这份剪贴板不存在，或者已经过期。", "err");
+      else if (r.status === 401) say("需要密码才能加图片。", "err");
       else if (r.status === 413) say("图片太大（单张上限 " + (root.dataset.maxAsset || "5 MiB") + "）。", "err");
       else {
         var m = r.json && r.json.error ? r.json.error.message : "上传失败（HTTP " + r.status + "）";
@@ -313,23 +467,30 @@ details.meta summary{cursor:pointer}
     }
   }
 
-  saveBtn.addEventListener("click", save);
+  if (lockbox) {
+    document.getElementById("unlock").addEventListener("click", unlock);
+    pwInput.addEventListener("keydown", function (ev) { if (ev.key === "Enter") unlock(); });
+  }
+  document.getElementById("setpw").addEventListener("click", setPassword);
+  document.getElementById("clearpw").addEventListener("click", clearPassword);
+  saveBtn.addEventListener("click", function () { save(false); });
   delBtn.addEventListener("click", async function () {
     if (!confirm("删除这份剪贴板？内容立刻消失，无法恢复。")) return;
-    var r = await api("DELETE", "/api/clips/" + encodeURIComponent(suffix), {
-      headers: { "X-Relay-Clip-Token": token }
-    });
+    var r = await api("DELETE", "/api/clips/" + encodeURIComponent(suffix));
     if (r.status === 204) {
       // Stay on the address instead of navigating away: the suffix is free
       // again, so "delete, then immediately write something else here" needs no
       // round trip through the landing page.
       polling = false;
-      try { localStorage.removeItem(PREFIX + suffix); } catch (e) {}
-      token = ""; writable = canWrite; exists = false;
+      storePw("");
+      password = "";
+      exists = false;
       body.value = ""; lastLoaded = ""; rev = 0; revEl.textContent = "0";
       thumbs.textContent = "";
       paint();
       say("已删除。这个后缀现在是空的，可以直接重新写。", "ok");
+    } else if (r.status === 401) {
+      say("需要密码才能删除。", "err");
     } else {
       say("删除失败（HTTP " + r.status + "）。", "err");
     }
@@ -366,38 +527,37 @@ details.meta summary{cursor:pointer}
     }
   });
 
-  document.getElementById("genkey").addEventListener("click", function () {
-    var box = document.getElementById("keyurl");
-    var copy = document.getElementById("copykey");
-    var note = document.getElementById("keynote");
-    if (!token) { say("这台浏览器没有写权限，拿不到编辑钥匙。", "err"); return; }
-    box.value = base + "/" + suffix + "#k=" + encodeURIComponent(token);
-    box.hidden = false; copy.hidden = false; note.hidden = false;
-    box.select();
-  });
-  document.getElementById("copykey").addEventListener("click", async function () {
-    var box = document.getElementById("keyurl");
-    try { await navigator.clipboard.writeText(box.value); say("编辑钥匙链接已复制", "ok"); }
-    catch (e) { box.select(); say("请按 Ctrl/Cmd+C 复制", "err"); }
-  });
-
   // Long-polling: hold one request open until the revision changes, then update.
   // A dirty textarea is never clobbered — someone typing on this machine would
   // otherwise lose their text to an update from the other one.
   //
-  // Only started once the clip exists: an empty suffix nobody has written yet
-  // has nothing to watch, and holding a request open for it would be pure noise.
-  // Only started once the clip exists: an empty suffix nobody has written yet
-  // has nothing to watch, and holding a request open for it would be pure noise.
-  function startPolling() { if (!polling) { polling = true; poll(); } }
-  async function poll() {
-    while (polling) {
+  // Only started once the clip exists and this tab may read it: an empty suffix
+  // nobody has written yet has nothing to watch, and holding a request open for
+  // a locked clip would just burn the unlock budget.
+  function startPolling() {
+    if (polling || locked) return;
+    polling = true;
+    pollGen += 1;
+    poll(pollGen);
+  }
+  async function poll(gen) {
+    while (polling && gen === pollGen) {
       try {
-        var r = await api("GET", "/api/clips/" + encodeURIComponent(suffix) + "?rev=" + rev + "&wait=25");
+        pollCtl = new AbortController();
+        var r = await api("GET", "/api/clips/" + encodeURIComponent(suffix) + "?rev=" + rev + "&wait=25",
+          { signal: pollCtl.signal });
+        if (r.status === 401) {
+          // The clip was protected (or re-keyed) while this page was watching.
+          // Switch to the locked view rather than sitting on a stale copy.
+          enterLocked("这份剪贴板已经设了密码，输入密码继续。");
+          return;
+        }
         if (r.ok && r.json && r.json.data) {
           var d = r.json.data;
           if (typeof d.rev === "number" && d.rev !== rev) {
             if (dirty()) {
+              // The other end changed while this one has unsaved edits. Never
+              // overwrite the local text; tell the user and let them decide.
               say("另一端已经更新（本地有未保存的改动，没有覆盖）", "err");
             } else {
               applyClip(d);
@@ -417,11 +577,12 @@ details.meta summary{cursor:pointer}
   }
 
   body.addEventListener("input", function () {
-    if (dirty()) say("有未保存的改动");
+    if (!dirty()) return;
+    say("有未保存的改动，停手就自动保存…");
+    scheduleAutosave();
   });
 
   paint();
-  if (hint) hint.hidden = exists;
   if (exists) startPolling();
   window.addEventListener("beforeunload", function (ev) {
     if (dirty()) { ev.preventDefault(); ev.returnValue = ""; }

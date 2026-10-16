@@ -76,19 +76,31 @@ curl -s -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/neversuch      # 
 curl -sI -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/robots.txt    # 200（不是 400）
 curl -s -X POST -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/ops1    # 405（公共路径只服务 GET/HEAD）
 
-# g) 部署产物能追溯到提交（见「已知约束」里线上那版无法复现的事）
+# e) 密码那套（改过密码/读路径时必须）—— 用一个真 clip 走一遍：
+SFX=deploycheck$RANDOM
+curl -s -X PUT -H 'Content-Type: application/json' \
+  -d '{"body":"PRIVATE-BODY","password":"deploy-check-pw"}' https://clip.hcyj.xyz/api/clips/$SFX >/dev/null
+curl -s -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/$SFX/raw                       # 必须非 200
+curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Clip-Password: deploy-check-pw' https://clip.hcyj.xyz/$SFX/raw   # 必须 200
+curl -s https://clip.hcyj.xyz/$SFX | grep -c 'data-state="locked"'                            # 必须 1
+curl -s https://clip.hcyj.xyz/$SFX | grep -c 'PRIVATE-BODY'                                    # 必须 0（正文不进 HTML）
+curl -s -X POST -H 'Content-Type: application/json' -d '{"password":"deploy-check-pw"}' \
+  https://clip.hcyj.xyz/api/clips/$SFX/unlock >/dev/null                                       # 解锁应 200
+curl -s -X DELETE -H 'X-Clip-Password: deploy-check-pw' https://clip.hcyj.xyz/api/clips/$SFX  # 清理（204）
+
+# f) 真库测试
+TEST_PG_DSN=... scripts/test-pg.sh
+
+# g) 真实浏览器（改过页面/脚本时必须；只依赖 Node 内建，无第三方包）
+node scripts/verify-clip-browser.cjs https://clip.hcyj.xyz
+
+# h) 部署产物能追溯到提交（见「已知约束」里线上那版无法复现的事）
 git -C <clip repo> status --porcelain                                          # 构建前必须为空
 V=$(curl -s https://clip.hcyj.xyz/api/health | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
 git -C <clip repo> cat-file -e "$V"                                            # 这个提交必须在历史里（-dirty 会在这里挂）
 git -C <clip repo> diff --stat "$V"..HEAD -- cmd/ internal/ scripts/           # 之后没有代码改动
 # 注意比的是「$V 之后没有代码改动」，不是「$V == HEAD」：部署后的纯文档提交
 # （.ai/ 之类）本来就会让 HEAD 往前走，做到等号就等于禁止事后写记忆库。
-
-# e) 真库测试
-TEST_PG_DSN=... scripts/test-pg.sh
-
-# f) 真实浏览器（改过页面/脚本时必须；只依赖 Node 内建，无第三方包）
-node scripts/verify-clip-browser.cjs https://clip.hcyj.xyz
 ```
 
 **大陆观测点**：`hcyj`（阿里云广州）、`koma`（腾讯云 124.221.144.97）。
@@ -109,6 +121,15 @@ sudo -u relay /data/services/clip/clip sweep      # 手动清一次过期（jani
 sudo sed -i 's/^CLIP_WRITES_ENABLED=.*/CLIP_WRITES_ENABLED=false/' /data/services/clip/clip.env
 sudo systemctl restart clip     # 读/raw/图片照旧，PUT/POST/DELETE 返回 503 writes_disabled
 ```
+
+## 密码相关的旋钮
+
+| 环境变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `CLIP_UNLOCK_PER_HOUR` | 20 | 每个源地址、每个后缀允许的**失败**解锁次数（成功的不过数，见 `clipAccess`） |
+
+**忘密码没有后门**：没有重置接口、没有找回流程（这是裁决过的）。忘了就只能等 `/sweep` 过期，
+或者换一个后缀。不要把“帮用户重置密码”当成一个缺失的功能——它是被明确拒绝的。
 
 ## 回滚
 
@@ -152,14 +173,17 @@ docker exec caddy ls /data/caddy/certificates/acme-v02.api.letsencrypt.org-direc
   方法/状态码矩阵只差当时还没修的 HEAD 与 405）。现已换成 `13ad95d`（干净树）。
   所以：**只从干净工作区构建**，部署后用验证的 g) 步核对。
 - **本机关机 = 服务不可用**，hcyj 上不会降级。这是「后端放本机」的直接代价。
-- **Caddy 站点级 `log` 会明文记录 `X-Relay-Clip-Token`**（Caddy 默认只脱敏
-  `Authorization`/`Cookie`）。要开日志必须同时过滤：
+- **Caddy 站点级 `log` 会明文记录 `X-Clip-Password`（和从前的 `X-Relay-Clip-Token`）**
+  （Caddy 默认只脱敏 `Authorization`/`Cookie`）。要开日志必须同时过滤：
 
   ```caddy
   log {
       format filter {
           wrap json
-          fields { request>headers>X-Relay-Clip-Token delete }
+          fields {
+              request>headers>X-Clip-Password delete
+              request>headers>X-Relay-Clip-Token delete
+          }
       }
   }
   ```

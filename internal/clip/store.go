@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zeroicey/clip/internal/clip/clipdb"
@@ -52,16 +53,25 @@ type AssetMeta struct {
 	ByteSize int64
 }
 
-// Clip is a clip as the API exposes it — never including the owner hash.
+// Clip is a clip as the store hands it to the API layer.
+//
+// PasswordHash is the only field that never reaches the wire: the API layer
+// converts it to the boolean `has_password` (see clipData). It is a *string so
+// that nil and the empty string cannot be confused — nil means "this clip is
+// public", and no valid PHC string is ever empty.
 type Clip struct {
-	Suffix    string
-	Rev       int64
-	Body      string
-	ExpiresAt int64 // epoch ms; 0 = never
-	CreatedAt int64
-	UpdatedAt int64
-	Assets    []AssetMeta
+	Suffix       string
+	Rev          int64
+	Body         string
+	PasswordHash *string
+	ExpiresAt    int64 // epoch ms; 0 = never
+	CreatedAt    int64
+	UpdatedAt    int64
+	Assets       []AssetMeta
 }
+
+// HasPassword reports whether reading or writing this clip needs a password.
+func (c *Clip) HasPassword() bool { return c.PasswordHash != nil }
 
 // Stats are the totals the quota is enforced against.
 type Stats struct {
@@ -217,18 +227,19 @@ func (s *Store) Get(ctx context.Context, suffix string) (*Clip, error) {
 	return s.withAssets(ctx, row)
 }
 
-func (s *Store) withAssets(ctx context.Context, row clipdb.Clip) (*Clip, error) {
+func (s *Store) withAssets(ctx context.Context, row clipdb.GetLiveClipRow) (*Clip, error) {
 	metas, err := s.q.ListAssetMeta(ctx, row.Suffix)
 	if err != nil {
 		return nil, fmt.Errorf("list assets: %w", err)
 	}
 	clip := &Clip{
-		Suffix:    row.Suffix,
-		Rev:       row.Rev,
-		Body:      row.Body,
-		ExpiresAt: row.ExpiresAt,
-		CreatedAt: row.CreatedAt,
-		UpdatedAt: row.UpdatedAt,
+		Suffix:       row.Suffix,
+		Rev:          row.Rev,
+		Body:         row.Body,
+		PasswordHash: passwordPtr(row.PasswordHash),
+		ExpiresAt:    row.ExpiresAt,
+		CreatedAt:    row.CreatedAt,
+		UpdatedAt:    row.UpdatedAt,
 	}
 	for _, m := range metas {
 		clip.Assets = append(clip.Assets, AssetMeta{Position: m.Position, Mime: m.Mime, ByteSize: m.ByteSize})
@@ -244,14 +255,51 @@ type CreateResult struct {
 	UpdatedAt int64
 }
 
+// passwordPtr converts the nullable column to the store's representation:
+// nil means "this clip has no password".
+func passwordPtr(t pgtype.Text) *string {
+	if !t.Valid {
+		return nil
+	}
+	v := t.String
+	return &v
+}
+
+// proofParam turns a verified password hash into the value the write queries
+// compare against. The empty string ("no credential supplied") becomes SQL NULL,
+// which never equals a stored hash — so a caller without the password cannot
+// write to a protected clip, while a public clip is still writable because its
+// own branch of the WHERE clause is `password_hash IS NULL`.
+func proofParam(proof string) pgtype.Text {
+	if proof == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: proof, Valid: true}
+}
+
+// passwordParam converts a freshly computed hash into the nullable column value;
+// nil means the clip being created is public.
+func passwordParam(hash *string) pgtype.Text {
+	if hash == nil {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *hash, Valid: true}
+}
+
 // Create claims a suffix and writes the first body.
+//
+// No credential is involved: a new clip is public unless passwordHash is set,
+// which is how "whoever sets a password first owns a public suffix" works — and
+// why the hash goes in with the INSERT rather than in a follow-up UPDATE (a
+// gap there would leave the content readable while the user believed it was
+// protected).
 //
 // The quota check and the claim run in one transaction guarded by an advisory
 // lock, so two simultaneous requests cannot both observe "under quota" and both
 // insert. Without that, the ceiling is a suggestion: the exact overshoot is
 // bounded by concurrency, which is precisely the case an abusive client
 // controls.
-func (s *Store) Create(ctx context.Context, suffix string, body string, ownerHash []byte, expiresAt int64) (*CreateResult, error) {
+func (s *Store) Create(ctx context.Context, suffix string, body string, expiresAt int64, passwordHash *string) (*CreateResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin create: %w", err)
@@ -270,12 +318,12 @@ func (s *Store) Create(ctx context.Context, suffix string, body string, ownerHas
 
 	now := s.nowMS()
 	row, err := q.ClaimSuffix(ctx, clipdb.ClaimSuffixParams{
-		Suffix:    suffix,
-		Body:      body,
-		BodyBytes: int64(len(body)),
-		OwnerHash: ownerHash,
-		ExpiresAt: expiresAt,
-		NowMs:     now,
+		Suffix:       suffix,
+		Body:         body,
+		BodyBytes:    int64(len(body)),
+		PasswordHash: passwordParam(passwordHash),
+		ExpiresAt:    expiresAt,
+		NowMs:        now,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -299,16 +347,22 @@ func (s *Store) Create(ctx context.Context, suffix string, body string, ownerHas
 	return &CreateResult{Rev: row.Rev, ExpiresAt: row.ExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}, nil
 }
 
-// Update replaces the body of a clip the caller owns.
+// Update replaces the body of a clip the caller is allowed to write.
+//
+// `proof` is the stored password hash the caller already verified in Go, or ""
+// for a public clip. It travels INTO the statement rather than being checked
+// before it: if the password is changed between the verification and this write,
+// the stored hash no longer equals proof, the statement matches no row, and the
+// caller gets ErrNotFound. A read-then-write would write anyway.
 //
 // expiresAt < 0 means "leave the current expiry alone" — expressed in SQL so the
 // decision does not need a read-then-write round trip.
-func (s *Store) Update(ctx context.Context, suffix string, ownerHash []byte, body string, expiresAt int64) (*CreateResult, error) {
+func (s *Store) Update(ctx context.Context, suffix, proof string, body string, expiresAt int64) (*CreateResult, error) {
 	row, err := s.q.UpdateClip(ctx, clipdb.UpdateClipParams{
 		Suffix:    suffix,
 		Body:      body,
 		BodyBytes: int64(len(body)),
-		OwnerHash: ownerHash,
+		ProofHash: proofParam(proof),
 		ExpiresAt: expiresAt,
 		NowMs:     s.nowMS(),
 	})
@@ -321,24 +375,62 @@ func (s *Store) Update(ctx context.Context, suffix string, ownerHash []byte, bod
 	return &CreateResult{Rev: row.Rev, ExpiresAt: row.ExpiresAt, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}, nil
 }
 
-// Delete removes a clip the caller owns. It reports whether anything was
-// deleted; a false is answered as 404 by the API, not as 403.
-func (s *Store) Delete(ctx context.Context, suffix string, ownerHash []byte) (bool, error) {
-	n, err := s.q.DeleteClip(ctx, clipdb.DeleteClipParams{Suffix: suffix, OwnerHash: ownerHash})
+// Delete removes a clip the caller is allowed to write. It reports whether
+// anything was deleted; a false is answered as 404 by the API, not as 403.
+func (s *Store) Delete(ctx context.Context, suffix, proof string) (bool, error) {
+	n, err := s.q.DeleteClip(ctx, clipdb.DeleteClipParams{Suffix: suffix, ProofHash: proofParam(proof)})
 	if err != nil {
 		return false, fmt.Errorf("delete clip: %w", err)
 	}
 	return n > 0, nil
 }
 
-// SetAssets replaces the whole image set of a clip the caller owns, and bumps
-// the revision so readers waiting on the old revision wake up.
+// SetPassword sets a password on a public clip — the "claim" — or replaces the
+// password on a protected one, in which case `proof` must be the currently
+// verified hash. Like every other write, the check is in the statement.
+func (s *Store) SetPassword(ctx context.Context, suffix, proof, newPasswordHash string) error {
+	n, err := s.q.SetClipPassword(ctx, clipdb.SetClipPasswordParams{
+		Suffix:       suffix,
+		PasswordHash: pgtype.Text{String: newPasswordHash, Valid: true},
+		ProofHash:    proofParam(proof),
+		NowMs:        s.nowMS(),
+	})
+	if err != nil {
+		return fmt.Errorf("set password: %w", err)
+	}
+	if n == 0 {
+		// No such clip, expired, or already claimed by a password we were not
+		// given. All three are the same opaque answer.
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearPassword removes the password, making the clip public again. The current
+// password must be proven first.
+func (s *Store) ClearPassword(ctx context.Context, suffix, proof string) error {
+	n, err := s.q.ClearClipPassword(ctx, clipdb.ClearClipPasswordParams{
+		Suffix:    suffix,
+		ProofHash: proofParam(proof),
+		NowMs:     s.nowMS(),
+	})
+	if err != nil {
+		return fmt.Errorf("clear password: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetAssets replaces the whole image set of a clip the caller may write, and
+// bumps the revision so readers waiting on the old revision wake up.
 //
 // Replacement is wholesale rather than per-image: positions are the address, so
 // a partial update would need a second addressing scheme (ids) that a client
 // would then have to track. Four images is well inside the size where replacing
 // everything is cheapest.
-func (s *Store) SetAssets(ctx context.Context, suffix string, ownerHash []byte, assets []Asset) (*CreateResult, error) {
+func (s *Store) SetAssets(ctx context.Context, suffix, proof string, assets []Asset) (*CreateResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin set assets: %w", err)
@@ -352,7 +444,7 @@ func (s *Store) SetAssets(ctx context.Context, suffix string, ownerHash []byte, 
 	// is gone) and nothing is written.
 	n, err := q.TouchClipRev(ctx, clipdb.TouchClipRevParams{
 		Suffix:    suffix,
-		OwnerHash: ownerHash,
+		ProofHash: proofParam(proof),
 		NowMs:     now,
 	})
 	if err != nil {

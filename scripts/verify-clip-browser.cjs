@@ -237,43 +237,36 @@ async function main() {
     await writer.send('Input.insertText', { text: TEXT });
     check('typed text landed in the textarea', (await writer.eval('document.getElementById("body").value')) === TEXT);
 
-    await writer.realClick('document.getElementById("save")');
-    const saved = await waitFor(writer,
-      'document.getElementById("status").textContent.includes("已保存") || document.getElementById("status").textContent.includes("已创建并保存")');
-    check('clicking 保存 reports success', saved,
+    // Autosave: type only, never click. This is the webnote-parity behaviour and
+    // the one thing a Go test cannot check — the debounce, the fetch and the
+    // status line have to work together in a real browser.
+    const autoSaved = await waitFor(writer,
+      'document.getElementById("status").textContent.includes("已自动保存")');
+    check('typing alone triggers autosave (no click)', autoSaved,
       await writer.eval('document.getElementById("status").textContent'));
-    check('a token was stored in localStorage',
-      (await writer.eval(`(localStorage.getItem('relay.clip.${SFX}') || '').length >= 40`)) === true);
-    check('save button stayed visible for the owner',
+    check('no credential is kept in localStorage any more',
+      (await writer.eval('Object.keys(localStorage).filter((k) => k.startsWith("relay.clip")).length')) === 0);
+    check('save button stayed visible',
       (await writer.eval('!document.getElementById("save").hidden')) === true);
-
-    // Lift the token into Node before touching storage: the reader step below
-    // clears this origin's localStorage, and two tabs of one browser share it,
-    // so reading it later would return null and every subsequent API call would
-    // go out unauthenticated.
-    const OWNER_TOKEN = await writer.eval(`localStorage.getItem('relay.clip.${SFX}')`);
-    check('the owner token was captured for later steps', (OWNER_TOKEN || '').length >= 40);
     await writer.shot('clip-writer.png');
 
     // The text reached the database, not just the DOM.
     const raw = await fetchText(`${BASE}/${SFX}/raw`);
     check('the server has the exact bytes', raw === TEXT, JSON.stringify(raw.slice(0, 40)));
 
-    // ---- machine B: a browser with no token ---------------------------------
+    // ---- machine B: a different browser, no password set --------------------
+    // Under the model adopted on 2026-10-16 a clip with no password is fully
+    // public, so the second browser is NOT read-only. That is asserted rather
+    // than skipped: it is the behaviour most likely to be mistaken for a bug
+    // later, and it is the price of the simple "password or nothing" model.
     reader = await newPage(port);
-    // Clear only this origin's localStorage so this page behaves like a
-    // different machine rather than the one that created the clip.
-    await reader.goto(`${BASE}/${SFX}`);
-    await reader.send('Storage.clearDataForOrigin', { origin: BASE, storageTypes: 'local_storage' });
     await reader.goto(`${BASE}/${SFX}`);
 
     check('the second browser sees the text', (await reader.eval('document.getElementById("body").value')) === TEXT);
-    check('and it is read-only there', (await reader.eval('document.getElementById("body").readOnly')) === true);
-    check('no save button for a reader', (await reader.eval('document.getElementById("save").hidden')) === true);
-    check('reader has no token in storage',
-      (await reader.eval(`localStorage.getItem('relay.clip.${SFX}') === null`)) === true);
-    check('reader is told why it is read-only',
-      (await reader.eval('document.getElementById("hint").textContent')).includes('只读'));
+    check('a passwordless clip is editable in a second browser too',
+      (await reader.eval('document.getElementById("body").readOnly')) === false);
+    check('the second browser is told the clip is public',
+      (await reader.eval('document.getElementById("hint").textContent')).includes('公开'));
     await reader.shot('clip-reader.png');
 
     // ---- live update: A writes, B is watching -------------------------------
@@ -281,12 +274,10 @@ async function main() {
     const updated = `${TEXT}appended from machine A\n`;
     const put = await fetchJSON(`${BASE}/api/clips/${SFX}`, 'PUT', {
       body: JSON.stringify({ body: updated }),
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Relay-Clip-Token': OWNER_TOKEN,
-      },
+      headers: { 'Content-Type': 'application/json' },
     });
-    check('the owner can update over the API', put.status === 200, `status ${put.status} ${put.body.slice(0, 120)}`);
+    check('a public clip accepts a credential-free update', put.status === 200,
+      `status ${put.status} ${put.body.slice(0, 120)}`);
 
     const live = await waitFor(reader, `document.getElementById("body").value.includes('appended from machine A')`, 35000);
     check('the watching reader updated without a reload', live,
@@ -294,6 +285,77 @@ async function main() {
     check('the reader was told it synced',
       (await reader.eval('document.getElementById("status").textContent')).length > 0,
       await reader.eval('document.getElementById("status").textContent'));
+
+    // ---- set a password through the real UI ---------------------------------
+    const PW = 'e2e-pass-9f3a';
+    await writer.eval(`(() => {
+      document.getElementById('newpw').value = ${JSON.stringify(PW)};
+      document.getElementById('setpw').click();
+      return true;
+    })()`);
+    const pwSet = await waitFor(writer,
+      'document.getElementById("status").textContent.includes("已设密码")');
+    check('setting a password from the panel reports success', pwSet,
+      await writer.eval('document.getElementById("status").textContent'));
+    check('the password is not persisted in localStorage',
+      (await writer.eval('Object.keys(localStorage).filter((k) => k.startsWith("relay.clip")).length')) === 0);
+
+    // ---- machine C: the clip is now locked ----------------------------------
+    // A THIRD browser: the second one's DOM still shows the old text, and a
+    // fresh page is what a stranger actually gets.
+    const stranger = await newPage(port);
+    await stranger.goto(`${BASE}/${SFX}`);
+    check('a protected clip renders in the locked state',
+      (await stranger.eval('document.body.dataset.state')) === 'locked');
+    check('the locked page has a password input',
+      (await stranger.eval('!!document.getElementById("pw")')) === true);
+    // The decisive one: the body must not be in the HTML at all. Rendering it and
+    // hiding it with CSS would make the password decoration.
+    const strangerHtml = await stranger.eval('document.documentElement.outerHTML');
+    check('the locked HTML does not contain the clip body',
+      !strangerHtml.includes('appended from machine A'));
+    check('the locked page hides the editor',
+      (await stranger.eval('document.getElementById("content").hidden')) === true);
+    await stranger.shot('clip-locked.png');
+
+    // Wrong password: refused, with a message, and still no content.
+    await stranger.eval(`(() => {
+      document.getElementById('pw').value = 'not-the-password';
+      document.getElementById('unlock').click();
+      return true;
+    })()`);
+    const refused = await waitFor(stranger,
+      'document.getElementById("lockstatus").textContent.length > 0');
+    check('a wrong password is refused with a message', refused,
+      await stranger.eval('document.getElementById("lockstatus").textContent'));
+    check('a refused unlock reveals no content',
+      (await stranger.eval('document.getElementById("content").hidden')) === true);
+
+    // Then the right one.
+    await stranger.eval(`(() => {
+      document.getElementById('pw').value = ${JSON.stringify(PW)};
+      document.getElementById('unlock').click();
+      return true;
+    })()`);
+    const unlocked = await waitFor(stranger,
+      'document.getElementById("body").value.includes("appended from machine A")');
+    check('the right password reveals the content', unlocked,
+      await stranger.eval('document.getElementById("lockstatus").textContent'));
+
+    // ---- the machine-readable paths are gated too ---------------------------
+    check('GET /raw without the password is refused',
+      (await fetchStatus(`${BASE}/${SFX}/raw`)) !== 200);
+    const gatedRaw = await fetchText(`${BASE}/${SFX}/raw`);
+    check('the refused /raw does not leak the body',
+      !gatedRaw.includes('appended from machine A'), JSON.stringify(gatedRaw.slice(0, 60)));
+    const okRaw = await fetchJSON(`${BASE}/${SFX}/raw`, 'GET', {
+	    headers: { 'X-Clip-Password': PW },
+    });
+    check('GET /raw with the password returns the bytes',
+      okRaw.status === 200 && okRaw.body.includes('appended from machine A'),
+      `status ${okRaw.status}`);
+    check('GET /api without the password is refused',
+      (await fetchStatus(`${BASE}/api/clips/${SFX}`)) !== 200);
 
     // ---- image upload by pasting into the page ------------------------------
     const pngB64 = Buffer.concat([
@@ -315,21 +377,56 @@ async function main() {
       await writer.eval('document.getElementById("status").textContent'));
     const thumbSrc = await writer.eval('document.querySelector("#thumbs img")?.src || ""');
     check('thumbnail points at the raw asset route', thumbSrc.endsWith(`/${SFX}/raw/0`), thumbSrc);
-    const imgStatus = await fetchStatus(`${BASE}/${SFX}/raw/0`);
-    check('the image is served back', imgStatus === 200, `status ${imgStatus}`);
+    check('the image route is gated too',
+      (await fetchStatus(`${BASE}/${SFX}/raw/0`)) !== 200);
+    const imgStatus = await fetchStatus(`${BASE}/${SFX}/raw/0`, { 'X-Clip-Password': PW });
+    check('the image is served back with the password', imgStatus === 200, `status ${imgStatus}`);
     await writer.shot('clip-with-image.png');
 
     // ---- console hygiene ----------------------------------------------------
-    const writerNoise = writer.console.filter((l) => !l.includes('favicon'));
-    const readerNoise = reader.console.filter((l) => !l.includes('favicon'));
+    // Two kinds of noise are expected, and each is paired below with an
+    // assertion that it was the expected thing and was handled:
+    //
+    //   - a 401 on the long poll: the clip became protected while these pages
+    //     were watching it, so the server (correctly) refused the request that
+    //     was already parked. Chrome logs every failed resource load, so this
+    //     shows up as console noise even though the page handles it.
+    //   - net::ERR_ABORTED: the page tears down its own parked poll when the
+    //     credential changes, rather than leaving a request in flight that was
+    //     authorised with a credential nobody holds any more.
+    const IGNORE = ['401 (Unauthorized)', 'net::ERR_ABORTED'];
+    const noise = (list) => list.filter((l) => !l.includes('favicon') && !IGNORE.some((p) => l.includes(p)));
+    const writerNoise = noise(writer.console);
+    const readerNoise = noise(reader.console);
     check('no console errors or CSP violations on the writer page', writerNoise.length === 0, writerNoise.join(' | '));
     check('no console errors or CSP violations on the reader page', readerNoise.length === 0, readerNoise.join(' | '));
-    check('no failed requests', writer.failed.length === 0 && reader.failed.length === 0,
-      [...writer.failed, ...reader.failed].join(' | '));
+    check('no unexpected failed requests',
+      noise(writer.failed).length === 0 && noise(reader.failed).length === 0,
+      [...noise(writer.failed), ...noise(reader.failed)].join(' | '));
+
+    // The ignored 401 was the interesting case, so it is asserted rather than
+    // merely tolerated: a page that was watching a public clip when it became
+    // protected must switch to the lock prompt and STOP showing the old text —
+    // not sit on a stale copy of a clip that is no longer public.
+    const watcherLocked = await waitFor(reader,
+      'document.getElementById("lockbox").hidden === false', 15000);
+    check('a watcher of a newly protected clip is switched to the lock prompt', watcherLocked,
+      await reader.eval('document.getElementById("lockstatus").textContent'));
+    check('and the stale content is cleared from the page',
+      (await reader.eval('document.getElementById("body").value')) === '',
+      JSON.stringify((await reader.eval('document.getElementById("body").value')).slice(0, 40)));
+    check('and it is told why',
+      (await reader.eval('document.getElementById("lockstatus").textContent')).includes('密码'));
+    await reader.shot('clip-reader-locked.png');
 
     // ---- cleanup ------------------------------------------------------------
+    // The clip now has a password, so the cleanup delete needs it — which is
+    // itself a check: a protected clip must not be deletable without it.
+    const noPwDelete = await fetchJSON(`${BASE}/api/clips/${SFX}`, 'DELETE');
+    check('a protected clip cannot be deleted without the password',
+      noPwDelete.status === 401 || noPwDelete.status === 404, `status ${noPwDelete.status}`);
     const del = await fetchJSON(`${BASE}/api/clips/${SFX}`, 'DELETE', {
-      headers: { 'X-Relay-Clip-Token': OWNER_TOKEN },
+      headers: { 'X-Clip-Password': PW },
     });
     check('cleanup: the test clip was deleted', del.status === 204, `status ${del.status}`);
   } finally {
@@ -353,8 +450,8 @@ async function fetchText(url) {
   return await res.text();
 }
 
-async function fetchStatus(url) {
-  const res = await fetch(url, { redirect: 'manual' });
+async function fetchStatus(url, headers) {
+  const res = await fetch(url, { redirect: 'manual', headers: headers || {} });
   return res.status;
 }
 

@@ -36,9 +36,15 @@ type Server struct {
 	store   *Store
 	hub     *hub
 	limiter *ratelimit.Limiter
-	log     *slog.Logger
-	version string
-	started time.Time
+	// unlockLimiter throttles password GUESSES, and only failures are counted
+	// (see clipAccess). It is separate from limiter because the two have
+	// opposite cost profiles: a write is cheap to reject, while a password check
+	// is deliberately expensive (argon2), so an unthrottled guesser is also a CPU
+	// and memory amplifier.
+	unlockLimiter *ratelimit.Limiter
+	log           *slog.Logger
+	version       string
+	started       time.Time
 }
 
 // NewServer builds the handler for the whole clip service.
@@ -48,9 +54,15 @@ func NewServer(cfg *Config, st *Store, version string, log *slog.Logger) (*Serve
 		store:   st,
 		hub:     newHub(1024),
 		limiter: ratelimit.New(cfg.WritePerHour, time.Hour),
-		log:     log,
-		version: version,
-		started: time.Now(),
+		// One limiter, two prefixed key namespaces (see clipAccess): the budget is
+		// "per source address AND per suffix". Prefixing is not cosmetic — an IP
+		// string and a suffix could otherwise collide into one bucket, which is
+		// the failure mode recorded in
+		// .ai/pitfalls/cases/2026-10-10-rate-limit-collapsed-to-one-bucket.md.
+		unlockLimiter: ratelimit.New(cfg.UnlockPerHour, time.Hour),
+		log:           log,
+		version:       version,
+		started:       time.Now(),
 	}
 	return s, s.router()
 }
@@ -120,6 +132,13 @@ func (s *Server) router() *gin.Engine {
 	r.PUT("/api/clips/:suffix", s.handlePutClip)
 	r.DELETE("/api/clips/:suffix", s.handleDeleteClip)
 	r.POST("/api/clips/:suffix/assets", s.handlePutAssets)
+	// The password surface. Separate endpoints rather than fields on the write
+	// body: setting a password is a distinct authority decision from editing the
+	// text, and mixing them would let an edit and a re-key happen in one
+	// partially-applied request.
+	r.POST("/api/clips/:suffix/unlock", s.handleUnlock)
+	r.PUT("/api/clips/:suffix/password", s.handleSetPassword)
+	r.DELETE("/api/clips/:suffix/password", s.handleClearPassword)
 
 	r.NoRoute(s.handlePublicPath)
 	return r
@@ -195,21 +214,24 @@ type assetData struct {
 }
 
 type clipData struct {
-	Suffix      string      `json:"suffix"`
-	Exists      bool        `json:"exists"`
-	Rev         int64       `json:"rev"`
-	Body        string      `json:"body"`
-	ExpiresAt   int64       `json:"expires_at"`
-	CreatedAt   int64       `json:"created_at"`
-	UpdatedAt   int64       `json:"updated_at"`
-	Assets      []assetData `json:"assets"`
-	URL         string      `json:"url"`
-	RawURL      string      `json:"raw_url"`
-	ExpiresText string      `json:"expires_text"`
-	// OwnerToken is present ONLY in the response to the request that created the
-	// clip. It is the one moment the plaintext exists; after that the server
-	// holds only its hash.
-	OwnerToken string `json:"owner_token,omitempty"`
+	Suffix    string      `json:"suffix"`
+	Exists    bool        `json:"exists"`
+	Rev       int64       `json:"rev"`
+	Body      string      `json:"body"`
+	ExpiresAt int64       `json:"expires_at"`
+	CreatedAt int64       `json:"created_at"`
+	UpdatedAt int64       `json:"updated_at"`
+	Assets    []assetData `json:"assets"`
+	URL       string      `json:"url"`
+	RawURL    string      `json:"raw_url"`
+	// HasPassword drives the page's "设置密码" vs "修改密码" choice, and tells a
+	// client that a write will need the password.
+	HasPassword bool `json:"has_password"`
+	// Locked marks the answer a locked clip gives when no password was supplied:
+	// the clip exists, its address is public, and its contents are not in this
+	// response. The page renders a prompt instead of an editor.
+	Locked      bool   `json:"locked"`
+	ExpiresText string `json:"expires_text"`
 }
 
 func (s *Server) clipData(clip *Clip) clipData {
@@ -224,6 +246,7 @@ func (s *Server) clipData(clip *Clip) clipData {
 		CreatedAt:   clip.CreatedAt,
 		UpdatedAt:   clip.UpdatedAt,
 		ExpiresText: expiresText(clip.ExpiresAt),
+		HasPassword: clip.HasPassword(),
 		Assets:      make([]assetData, 0, len(clip.Assets)),
 	}
 	for _, a := range clip.Assets {
@@ -248,6 +271,123 @@ func (s *Server) emptyClipData(suffix string) clipData {
 		URL:       s.cfg.ClipURL(suffix),
 		RawURL:    s.cfg.RawURL(suffix),
 	}
+}
+
+// lockedClipData is what a locked clip answers when no (or a wrong) password was
+// supplied: the fact that it is locked, and nothing else.
+//
+// No body, no asset list, no revision. The revision is withheld on purpose —
+// it is a change counter, and publishing it would let a stranger watch how
+// often a private clip is edited.
+func (s *Server) lockedClipData(suffix string) clipData {
+	return clipData{
+		Suffix:      suffix,
+		Exists:      true,
+		Locked:      true,
+		HasPassword: true,
+		Assets:      []assetData{},
+		URL:         s.cfg.ClipURL(suffix),
+		RawURL:      s.cfg.RawURL(suffix),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// access
+// ---------------------------------------------------------------------------
+
+// passwordFrom reads the password the caller supplied.
+//
+// A header, never a query parameter or a path segment: those reach access logs
+// (including Caddy's, which records every header unless filtered), browser
+// history and Referer headers. The reasoning that keeps the write token out of
+// the URL applies to the password for the same reason.
+func passwordFrom(c *gin.Context) string {
+	return c.GetHeader("X-Clip-Password")
+}
+
+// clipAccess decides whether this request may see (and write) the clip, and
+// returns the proof that write statements require.
+//
+// The model, per .ai/decisions/2026-10-16-clip-open-edit-and-ownership.md: a
+// clip with no password is public — anyone may read and write it — and a clip
+// with a password is readable and writable only by someone who knows it. There
+// is no third credential; the owner token this service used to mint is gone.
+//
+// `proof` is the STORED HASH, not the password: it is what the write queries
+// compare against (see queries/clips.sql). Returning it lets a caller verify
+// once and then write, while a password change in between still invalidates the
+// write.
+//
+// When access is denied this writes the response itself, so callers only have
+// to check the boolean.
+// passwordDecision is the single verification path, shared by the JSON API, the
+// raw views and the unlock endpoint. It returns either the proof a write needs,
+// or the refusal as (status, code, message) so each caller can shape it for its
+// own audience — the /api namespace answers in the envelope, while a page path
+// answers text/plain (/raw is read by curl).
+//
+// status == 0 means allowed.
+func (s *Server) passwordDecision(c *gin.Context, clip *Clip, password string) (string, int, string, string) {
+	if clip == nil || !clip.HasPassword() {
+		return "", 0, "", ""
+	}
+
+	// Two namespaces, so the budget is per source address AND per suffix. Either
+	// alone is insufficient: per-IP lets an attacker with many addresses hammer
+	// one suffix, and per-suffix lets one address spray every suffix it can
+	// guess.
+	ipKey := "ip:" + clientip.ClientIP(c.Request)
+	suffixKey := "suffix:" + clip.Suffix
+
+	// Checked BEFORE verifying, because verification is the expensive part
+	// (argon2 at 19 MiB). An unthrottled guesser is a memory/CPU amplifier, not
+	// just a confidentiality problem.
+	if s.unlockLimiter.Blocked(ipKey) || s.unlockLimiter.Blocked(suffixKey) {
+		c.Header("Retry-After", strconv.Itoa(s.unlockLimiter.RetryAfter()))
+		return "", http.StatusTooManyRequests, "rate_limited", "密码试得太频繁了，稍后再试。"
+	}
+
+	if password == "" {
+		return "", http.StatusUnauthorized, "password_required", "这个剪贴板需要密码。"
+	}
+	if !verifyPassword(*clip.PasswordHash, password) {
+		// Only failures consume budget. A correct password never exhausts
+		// anything, so a reader may poll — the long-poll re-sends the password on
+		// every request — as often as it likes while a guesser is throttled.
+		s.unlockLimiter.Allow(ipKey)
+		s.unlockLimiter.Allow(suffixKey)
+		return "", http.StatusUnauthorized, "password_incorrect", "密码不对。"
+	}
+	return *clip.PasswordHash, 0, "", ""
+}
+
+// clipAccess is passwordDecision for the JSON API: refusals come back in the
+// documented envelope.
+func (s *Server) clipAccess(c *gin.Context, clip *Clip, password string) (string, bool) {
+	proof, status, code, msg := s.passwordDecision(c, clip, password)
+	if status != 0 {
+		fail(c, status, code, msg)
+		return "", false
+	}
+	return proof, true
+}
+
+// rawAccess is passwordDecision for the page/raw namespace, which answers in
+// text/plain — the same shape as its 404s, so a script parsing these routes
+// never has to switch parsers on the status code.
+func (s *Server) rawAccess(c *gin.Context, clip *Clip, password string) (string, bool) {
+	proof, status, code, msg := s.passwordDecision(c, clip, password)
+	if status != 0 {
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		c.Header("Cache-Control", "no-store")
+		if status == http.StatusUnauthorized {
+			msg += "用 curl 的话：加 -H 'X-Clip-Password: <密码>'。"
+		}
+		_ = code // the text form carries no machine-readable code
+		c.String(status, msg+"\n")
+		return "", false
+	}
+	return proof, true
 }
 
 func (s *Server) rawAssetURL(suffix string, position int16) string {
@@ -299,6 +439,13 @@ func (s *Server) handleGetClip(c *gin.Context) {
 		return
 	}
 
+	// A locked clip refuses here, before any waiting: an unauthorised caller
+	// must not be able to hold a long-poll connection open (or to learn, from
+	// the timing of an empty answer, that the clip changed).
+	if _, allowed := s.clipAccess(c, clip, passwordFrom(c)); !allowed {
+		return
+	}
+
 	// Long-poll only when the caller is already up to date. If they are behind,
 	// answering immediately is both correct and faster than waiting.
 	if wait > 0 && rev >= 0 && (clip == nil || clip.Rev == rev) {
@@ -321,6 +468,12 @@ func (s *Server) handleGetClip(c *gin.Context) {
 			if err != nil && !errors.Is(err, ErrNotFound) {
 				s.log.Error("re-read clip after wait", "suffix", suffix, "error", err)
 				fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
+				return
+			}
+			// Re-checked rather than trusted from before the wait: the password can
+			// be changed (or set) while this request is parked, and the reader would
+			// otherwise be handed the new content on the strength of an old check.
+			if _, allowed := s.clipAccess(c, clip, passwordFrom(c)); !allowed {
 				return
 			}
 		}
@@ -346,6 +499,10 @@ type putRequest struct {
 	// things: absent = the default TTL, 0 = never expires. Only a human can
 	// choose "forever", and only explicitly.
 	ExpiresInHours *float64 `json:"expiresInHours"`
+	// Password, when present, protects the clip AT CREATION. It is rejected on a
+	// write to an existing clip, where changing the password goes through
+	// PUT /api/clips/<suffix>/password instead — see the check in handlePutClip.
+	Password *string `json:"password"`
 }
 
 func (s *Server) handlePutClip(c *gin.Context) {
@@ -374,7 +531,6 @@ func (s *Server) handlePutClip(c *gin.Context) {
 		return
 	}
 
-	token := c.GetHeader("X-Relay-Clip-Token")
 	ctx := c.Request.Context()
 
 	// A negative TTL would produce a clip that is born expired, which is never
@@ -385,48 +541,73 @@ func (s *Server) handlePutClip(c *gin.Context) {
 		return
 	}
 
-	if token != "" {
-		// A caller with a token is trying to update. If the suffix is not
-		// theirs, fall through to the create path — the answer either way is
-		// the same, and this ordering means one suffix cannot be hijacked by
-		// simply omitting the token.
+	// Read what is stored first: whether this write needs a password depends on
+	// the clip's own state, which the caller cannot know without reading it.
+	existing, err := s.store.Get(ctx, suffix)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		s.log.Error("get clip for write", "suffix", suffix, "error", err)
+		fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
+		return
+	}
+	proof, allowed := s.clipAccess(c, existing, passwordFrom(c))
+	if !allowed {
+		return
+	}
+
+	if existing != nil {
+		if body.Password != nil {
+			// Changing the password is not folded into a body write on purpose:
+			// one partially-applied request could otherwise both replace the text
+			// and re-key the clip, and the caller could not tell which half
+			// happened.
+			fail(c, http.StatusBadRequest, "bad_request",
+				"改密码请用 PUT /api/clips/<后缀>/password，不要放在正文里。")
+			return
+		}
 		expiresAt := int64(-1) // keep whatever the clip already has
 		if body.ExpiresInHours != nil {
 			expiresAt = expiryFromHours(*body.ExpiresInHours)
 		}
-		res, err := s.store.Update(ctx, suffix, hashOwnerToken(token), body.Body, expiresAt)
-		if err == nil {
-			s.hub.publish(suffix)
-			clip, gerr := s.store.Get(ctx, suffix)
-			if gerr != nil {
-				fail(c, http.StatusInternalServerError, "internal_error", "saved, but could not read it back")
-				return
-			}
-			_ = res
-			ok(c, http.StatusOK, s.clipData(clip))
-			return
-		}
-		if !errors.Is(err, ErrNotFound) {
+		if _, err := s.store.Update(ctx, suffix, proof, body.Body, expiresAt); err != nil {
 			s.writeStoreError(c, err)
 			return
 		}
+		s.hub.publish(suffix)
+		clip, gerr := s.store.Get(ctx, suffix)
+		if gerr != nil {
+			fail(c, http.StatusInternalServerError, "internal_error", "saved, but could not read it back")
+			return
+		}
+		ok(c, http.StatusOK, s.clipData(clip))
+		return
 	}
 
-	// Create. The token is minted here and returned exactly once.
+	// Create. A new clip is public unless this very request asks for a password,
+	// in which case the hash is inserted with the row: creating the clip and then
+	// protecting it in a second request would leave a window where the content is
+	// readable by anyone while the user believes they made it private.
 	expiresAt := expiresAtFromDefault(s.cfg)
 	if body.ExpiresInHours != nil {
 		expiresAt = expiryFromHours(*body.ExpiresInHours)
 	}
-	newToken, hash, err := newOwnerToken()
-	if err != nil {
-		s.log.Error("mint owner token", "error", err)
-		fail(c, http.StatusInternalServerError, "internal_error", "could not mint a write token")
-		return
+	var newHash *string
+	if body.Password != nil {
+		if err := CheckPassword(*body.Password); err != nil {
+			fail(c, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		h, herr := hashPassword(*body.Password)
+		if herr != nil {
+			s.log.Error("hash password", "error", herr)
+			fail(c, http.StatusInternalServerError, "internal_error", "密码处理失败。")
+			return
+		}
+		newHash = &h
 	}
-	if _, err := s.store.Create(ctx, suffix, body.Body, hash, expiresAt); err != nil {
+	if _, err := s.store.Create(ctx, suffix, body.Body, expiresAt, newHash); err != nil {
 		if errors.Is(err, ErrTaken) {
 			fail(c, http.StatusConflict, "suffix_taken",
-				fmt.Sprintf("后缀 %q 已经被占用了，换一个，或者用编辑钥匙链接打开。", suffix))
+				fmt.Sprintf("后缀 %q 已经被占用了，换一个。", suffix))
 			return
 		}
 		s.writeStoreError(c, err)
@@ -439,9 +620,7 @@ func (s *Server) handlePutClip(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, "internal_error", "created, but could not read it back")
 		return
 	}
-	d := s.clipData(clip)
-	d.OwnerToken = newToken
-	ok(c, http.StatusCreated, d)
+	ok(c, http.StatusCreated, s.clipData(clip))
 }
 
 func (s *Server) handleDeleteClip(c *gin.Context) {
@@ -454,21 +633,31 @@ func (s *Server) handleDeleteClip(c *gin.Context) {
 		fail(c, http.StatusServiceUnavailable, "writes_disabled", "这个服务当前只读。")
 		return
 	}
-	token := c.GetHeader("X-Relay-Clip-Token")
-	if token == "" {
-		// No token is not "not yours, but try again": without it there is no
-		// way this request could ever be authorised, so say so rather than
-		// returning a bare 404 that reads like a bug.
-		fail(c, http.StatusUnauthorized, "unauthorized", "删除需要编辑钥匙（X-Relay-Clip-Token）。")
+	ctx := c.Request.Context()
+	// Read before deleting: a protected clip must not be deletable by someone
+	// who cannot read it. There is no separate delete credential — the password
+	// is the only one, and it guards removal exactly as it guards a rewrite.
+	existing, err := s.store.Get(ctx, suffix)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		s.log.Error("get clip for delete", "suffix", suffix, "error", err)
+		fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
 		return
 	}
-	deleted, err := s.store.Delete(c.Request.Context(), suffix, hashOwnerToken(token))
+	if existing == nil {
+		fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板。")
+		return
+	}
+	proof, allowed := s.clipAccess(c, existing, passwordFrom(c))
+	if !allowed {
+		return
+	}
+	deleted, err := s.store.Delete(ctx, suffix, proof)
 	if err != nil {
 		s.writeStoreError(c, err)
 		return
 	}
 	if !deleted {
-		fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板，或者钥匙不对。")
+		fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板。")
 		return
 	}
 	s.hub.publish(suffix)
@@ -499,14 +688,27 @@ func (s *Server) handlePutAssets(c *gin.Context) {
 		fail(c, http.StatusServiceUnavailable, "writes_disabled", "这个服务当前只读。")
 		return
 	}
-	token := c.GetHeader("X-Relay-Clip-Token")
-	if token == "" {
-		fail(c, http.StatusUnauthorized, "unauthorized", "上传需要编辑钥匙（X-Relay-Clip-Token）。")
-		return
-	}
 	if !s.limiter.Allow(clientip.ClientIP(c.Request)) {
 		c.Header("Retry-After", strconv.Itoa(s.limiter.RetryAfter()))
 		fail(c, http.StatusTooManyRequests, "rate_limited", "写得太频繁了，稍后再试。")
+		return
+	}
+
+	// The asset route is behind the same password as the text: images are
+	// content, and a password that guarded only the body would leave the
+	// screenshots readable.
+	assetClip, err := s.store.Get(c.Request.Context(), suffix)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		s.log.Error("get clip for assets", "suffix", suffix, "error", err)
+		fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
+		return
+	}
+	if assetClip == nil {
+		fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板。")
+		return
+	}
+	assetProof, assetAllowed := s.clipAccess(c, assetClip, passwordFrom(c))
+	if !assetAllowed {
 		return
 	}
 
@@ -559,9 +761,9 @@ func (s *Server) handlePutAssets(c *gin.Context) {
 		assets = append(assets, Asset{Position: int16(i), Mime: mime, Bytes: data})
 	}
 
-	if _, err := s.store.SetAssets(c.Request.Context(), suffix, hashOwnerToken(token), assets); err != nil {
+	if _, err := s.store.SetAssets(c.Request.Context(), suffix, assetProof, assets); err != nil {
 		if errors.Is(err, ErrNotFound) {
-			fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板，或者钥匙不对。")
+			fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板，或者密码不对。")
 			return
 		}
 		if errors.Is(err, ErrQuota) {
@@ -579,6 +781,199 @@ func (s *Server) handlePutAssets(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, "internal_error", "上传成功，但没能读回来。")
 		return
 	}
+	ok(c, http.StatusOK, s.clipData(clip))
+}
+
+// ---------------------------------------------------------------------------
+// password
+// ---------------------------------------------------------------------------
+
+// maxPasswordBytes bounds the password request bodies. Generous next to the 128
+// character limit (which is counted in runes, so up to 512 bytes) and small
+// enough that the parse cannot be used to allocate.
+const maxPasswordBytes = 4 << 10
+
+// passwordRequest is the body of the unlock and set-password endpoints.
+// Camel-case on the way in, per the project's convention.
+type passwordRequest struct {
+	Password string `json:"password"`
+}
+
+// handleUnlock exchanges a password for the clip's contents.
+//
+// The page cannot obtain them any other way: a locked clip is rendered as a
+// shell with no body in it, precisely so the HTML never carries protected text
+// into a browser that has not proved it may see it.
+//
+// This is also the only place a password travels in a request body; everywhere
+// else it is the X-Clip-Password header. Neither is a URL, so it never reaches
+// an access log, browser history or a Referer.
+func (s *Server) handleUnlock(c *gin.Context) {
+	suffix := c.Param("suffix")
+	if err := ValidateSuffix(suffix); err != nil {
+		failInvalidSuffix(c, err)
+		return
+	}
+	body := passwordRequest{}
+	if err := readJSONInto(c, maxPasswordBytes, &body); err != nil {
+		s.writeReadError(c, err)
+		return
+	}
+
+	clip, err := s.store.Get(c.Request.Context(), suffix)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		s.log.Error("get clip for unlock", "suffix", suffix, "error", err)
+		fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
+		return
+	}
+	if clip == nil {
+		// 404, not 401: no password would help, because there is nothing there.
+		// This does tell the caller the suffix is absent. That is a deliberate
+		// trade — the page has to reveal "exists and is locked" in order to show
+		// a prompt at all, so pretending otherwise here would only make the API
+		// harder to use without making anything secret (see the decision record).
+		fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板。")
+		return
+	}
+	if _, allowed := s.clipAccess(c, clip, body.Password); !allowed {
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	ok(c, http.StatusOK, s.clipData(clip))
+}
+
+// handleSetPassword sets a password on a public clip, or replaces the password
+// on a protected one.
+//
+// Setting one on a public clip is the "claim": there is no account and no
+// creator record, so the password IS the ownership claim. That means anyone who
+// can reach a public suffix may claim it, including someone who did not write
+// its contents — accepted explicitly in
+// .ai/decisions/2026-10-16-clip-open-edit-and-ownership.md, and the reason the
+// page tells a user to set a password on anything they care about.
+func (s *Server) handleSetPassword(c *gin.Context) {
+	suffix := c.Param("suffix")
+	if err := ValidateSuffix(suffix); err != nil {
+		failInvalidSuffix(c, err)
+		return
+	}
+	if !s.cfg.WritesEnabled {
+		fail(c, http.StatusServiceUnavailable, "writes_disabled", "这个服务当前只读。")
+		return
+	}
+	if !s.limiter.Allow(clientip.ClientIP(c.Request)) {
+		c.Header("Retry-After", strconv.Itoa(s.limiter.RetryAfter()))
+		fail(c, http.StatusTooManyRequests, "rate_limited", "写得太频繁了，稍后再试。")
+		return
+	}
+	body := passwordRequest{}
+	if err := readJSONInto(c, maxPasswordBytes, &body); err != nil {
+		s.writeReadError(c, err)
+		return
+	}
+	if err := CheckPassword(body.Password); err != nil {
+		fail(c, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+
+	ctx := c.Request.Context()
+	existing, err := s.store.Get(ctx, suffix)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		s.log.Error("get clip for set password", "suffix", suffix, "error", err)
+		fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
+		return
+	}
+	if existing == nil {
+		// A password belongs to a clip; there is nothing to protect yet.
+		fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板（先写下内容创建它，再设密码）。")
+		return
+	}
+	// A public clip needs no credential (this is the claim); a protected one
+	// requires the current password before it can be re-keyed.
+	proof, allowed := s.clipAccess(c, existing, passwordFrom(c))
+	if !allowed {
+		return
+	}
+
+	hash, err := hashPassword(body.Password)
+	if err != nil {
+		s.log.Error("hash password", "error", err)
+		fail(c, http.StatusInternalServerError, "internal_error", "密码处理失败。")
+		return
+	}
+	if err := s.store.SetPassword(ctx, suffix, proof, hash); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板，或者密码不对。")
+			return
+		}
+		s.writeStoreError(c, err)
+		return
+	}
+
+	clip, err := s.store.Get(ctx, suffix)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "internal_error", "saved, but could not read it back")
+		return
+	}
+	s.hub.publish(suffix)
+	c.Header("Cache-Control", "no-store")
+	ok(c, http.StatusOK, s.clipData(clip))
+}
+
+// handleClearPassword removes the password, making the clip public again.
+//
+// The current password is required (it arrives in X-Clip-Password, like every
+// other authenticated request). "Forgot the password" is not recoverable and
+// this endpoint deliberately cannot be used to recover one: there is no
+// administrator and no reset flow, so the only ways out of a forgotten password
+// are to let the clip expire or to take a different suffix.
+func (s *Server) handleClearPassword(c *gin.Context) {
+	suffix := c.Param("suffix")
+	if err := ValidateSuffix(suffix); err != nil {
+		failInvalidSuffix(c, err)
+		return
+	}
+	if !s.cfg.WritesEnabled {
+		fail(c, http.StatusServiceUnavailable, "writes_disabled", "这个服务当前只读。")
+		return
+	}
+	if !s.limiter.Allow(clientip.ClientIP(c.Request)) {
+		c.Header("Retry-After", strconv.Itoa(s.limiter.RetryAfter()))
+		fail(c, http.StatusTooManyRequests, "rate_limited", "写得太频繁了，稍后再试。")
+		return
+	}
+
+	ctx := c.Request.Context()
+	existing, err := s.store.Get(ctx, suffix)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		s.log.Error("get clip for clear password", "suffix", suffix, "error", err)
+		fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
+		return
+	}
+	if existing == nil {
+		fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板。")
+		return
+	}
+	proof, allowed := s.clipAccess(c, existing, passwordFrom(c))
+	if !allowed {
+		return
+	}
+	if err := s.store.ClearPassword(ctx, suffix, proof); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			fail(c, http.StatusNotFound, "not_found", "没有这份剪贴板，或者密码不对。")
+			return
+		}
+		s.writeStoreError(c, err)
+		return
+	}
+
+	clip, err := s.store.Get(ctx, suffix)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "internal_error", "saved, but could not read it back")
+		return
+	}
+	s.hub.publish(suffix)
+	c.Header("Cache-Control", "no-store")
 	ok(c, http.StatusOK, s.clipData(clip))
 }
 
@@ -700,6 +1095,12 @@ func (s *Server) serveRawText(c *gin.Context, suffix string) {
 		c.String(http.StatusInternalServerError, "internal error")
 		return
 	}
+	// /raw is the route the README promises to `curl`, so it is gated exactly
+	// like the page: a password that the machine-readable view skipped would not
+	// be a lock at all.
+	if _, allowed := s.rawAccess(c, clip, passwordFrom(c)); !allowed {
+		return
+	}
 	h := c.Writer.Header()
 	// text/plain is not a scripting context, but the body is arbitrary bytes:
 	// `nosniff` stops a browser from second-guessing the type, and the CSP is
@@ -717,6 +1118,21 @@ func (s *Server) serveRawText(c *gin.Context, suffix string) {
 func (s *Server) serveRawAsset(c *gin.Context, suffix string, position int16) {
 	if err := ValidateSuffix(suffix); err != nil {
 		notFoundPlain(c)
+		return
+	}
+	// Read the clip first: whether this asset needs a password is a property of
+	// the clip, and the row that carries the hash is the only place to learn it.
+	clip, err := s.store.Get(c.Request.Context(), suffix)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			notFoundPlain(c)
+			return
+		}
+		s.log.Error("get clip for asset", "suffix", suffix, "error", err)
+		c.String(http.StatusInternalServerError, "internal error")
+		return
+	}
+	if _, allowed := s.rawAccess(c, clip, passwordFrom(c)); !allowed {
 		return
 	}
 	mime, data, err := s.store.Asset(c.Request.Context(), suffix, position)
@@ -796,27 +1212,41 @@ func (e *unsupportedTypeError) Error() string { return e.msg }
 // the teleport API's rule: a client that sends a field this service does not
 // understand has a bug or a wrong idea of the contract, and silently ignoring it
 // turns "my TTL was ignored" into a mystery.
+// readJSONBody reads a write request.
+//
+// It is a thin wrapper over readJSONInto so the password endpoints can use their
+// own (much smaller) body shape without duplicating the content-type check, the
+// size cap and the error taxonomy.
 func readJSONBody(c *gin.Context, maxBytes int64) (putRequest, error) {
 	var req putRequest
+	err := readJSONInto(c, maxBytes, &req)
+	// The text limit is a property of a *body*, not of JSON: only a write request
+	// has one, so it is checked here rather than in the shared decoder.
+	if err == nil && int64(len(req.Body)) > maxBytes {
+		err = &tooLargeError{msg: fmt.Sprintf("文本超过上限（%s）。", humanBytes(maxBytes))}
+	}
+	return req, err
+}
+
+// readJSONInto decodes a JSON request body into dst, bounding the read and
+// rejecting a content type this service does not accept.
+func readJSONInto(c *gin.Context, maxBytes int64, dst any) error {
 	if ct := c.GetHeader("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-		return req, &unsupportedTypeError{msg: "Content-Type 必须是 application/json"}
+		return &unsupportedTypeError{msg: "Content-Type 必须是 application/json"}
 	}
 	// A little slack over the limit so the error is "body too large" rather than
 	// a confusing JSON syntax error at the exact boundary.
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes+4096)
 	dec := json.NewDecoder(c.Request.Body)
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := dec.Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			return req, &tooLargeError{msg: fmt.Sprintf("文本超过上限（%s）。", humanBytes(maxBytes))}
+			return &tooLargeError{msg: fmt.Sprintf("文本超过上限（%s）。", humanBytes(maxBytes))}
 		}
-		return req, fmt.Errorf("请求体不是合法的 JSON：%w", err)
+		return fmt.Errorf("请求体不是合法的 JSON：%w", err)
 	}
-	if int64(len(req.Body)) > maxBytes {
-		return req, &tooLargeError{msg: fmt.Sprintf("文本超过上限（%s）。", humanBytes(maxBytes))}
-	}
-	return req, nil
+	return nil
 }
 
 func (s *Server) writeReadError(c *gin.Context, err error) {

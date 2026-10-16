@@ -7,30 +7,32 @@ package clipdb
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const claimSuffix = `-- name: ClaimSuffix :one
-INSERT INTO clips (suffix, rev, body, body_bytes, owner_hash, expires_at, created_at, updated_at)
+INSERT INTO clips (suffix, rev, body, body_bytes, password_hash, expires_at, created_at, updated_at)
 VALUES ($1, 1, $2, $3, $4, $5, $6, $6)
 ON CONFLICT (suffix) DO UPDATE SET
-  rev         = 1,
-  body        = EXCLUDED.body,
-  body_bytes  = EXCLUDED.body_bytes,
-  owner_hash  = EXCLUDED.owner_hash,
-  expires_at  = EXCLUDED.expires_at,
-  created_at  = EXCLUDED.created_at,
-  updated_at  = EXCLUDED.updated_at
+  rev           = 1,
+  body          = EXCLUDED.body,
+  body_bytes    = EXCLUDED.body_bytes,
+  password_hash = EXCLUDED.password_hash,
+  expires_at    = EXCLUDED.expires_at,
+  created_at    = EXCLUDED.created_at,
+  updated_at    = EXCLUDED.updated_at
 WHERE clips.expires_at <> 0 AND clips.expires_at <= $6
 RETURNING rev, expires_at, created_at, updated_at
 `
 
 type ClaimSuffixParams struct {
-	Suffix    string
-	Body      string
-	BodyBytes int64
-	OwnerHash []byte
-	ExpiresAt int64
-	NowMs     int64
+	Suffix       string
+	Body         string
+	BodyBytes    int64
+	PasswordHash pgtype.Text
+	ExpiresAt    int64
+	NowMs        int64
 }
 
 type ClaimSuffixRow struct {
@@ -48,12 +50,17 @@ type ClaimSuffixRow struct {
 // rows and the caller is told "taken" by a clip nobody can read. The WHERE on
 // the DO UPDATE arm is what makes this atomic — a live row conflicts, matches
 // nothing, and returns no rows.
+//
+// 新 clip 的 password_hash 由调用方给（NULL = 公开）。在**创建时**就能带上密码，
+// 是为了避免「先建公开的、再设密码」中间那道缝：那道缝里内容对所有人可读，
+// 而用户以为自己已经设成私有的了。接管一个过期行时同样用新值（EXCLUDED），
+// 旧主人的密码不能顺延到新主人的 clip 上。
 func (q *Queries) ClaimSuffix(ctx context.Context, arg ClaimSuffixParams) (ClaimSuffixRow, error) {
 	row := q.db.QueryRow(ctx, claimSuffix,
 		arg.Suffix,
 		arg.Body,
 		arg.BodyBytes,
-		arg.OwnerHash,
+		arg.PasswordHash,
 		arg.ExpiresAt,
 		arg.NowMs,
 	)
@@ -65,6 +72,30 @@ func (q *Queries) ClaimSuffix(ctx context.Context, arg ClaimSuffixParams) (Claim
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const clearClipPassword = `-- name: ClearClipPassword :execrows
+UPDATE clips
+SET password_hash = NULL,
+    updated_at    = $1
+WHERE suffix = $2
+  AND (password_hash IS NULL OR password_hash = $3)
+`
+
+type ClearClipPasswordParams struct {
+	NowMs     int64
+	Suffix    string
+	ProofHash pgtype.Text
+}
+
+// Remove the password, making the clip public again. Requires proving the
+// current password (or that there is none).
+func (q *Queries) ClearClipPassword(ctx context.Context, arg ClearClipPasswordParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearClipPassword, arg.NowMs, arg.Suffix, arg.ProofHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteAssets = `-- name: DeleteAssets :exec
@@ -79,16 +110,16 @@ func (q *Queries) DeleteAssets(ctx context.Context, suffix string) error {
 const deleteClip = `-- name: DeleteClip :execrows
 DELETE FROM clips
 WHERE suffix = $1
-  AND owner_hash = $2
+  AND (password_hash IS NULL OR password_hash = $2)
 `
 
 type DeleteClipParams struct {
 	Suffix    string
-	OwnerHash []byte
+	ProofHash pgtype.Text
 }
 
 func (q *Queries) DeleteClip(ctx context.Context, arg DeleteClipParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteClip, arg.Suffix, arg.OwnerHash)
+	result, err := q.db.Exec(ctx, deleteClip, arg.Suffix, arg.ProofHash)
 	if err != nil {
 		return 0, err
 	}
@@ -134,32 +165,53 @@ func (q *Queries) GetAsset(ctx context.Context, arg GetAssetParams) (GetAssetRow
 
 const getClip = `-- name: GetClip :one
 
-SELECT suffix, rev, body, body_bytes, owner_hash, expires_at, created_at, updated_at
+SELECT suffix, rev, body, body_bytes, password_hash, expires_at, created_at, updated_at
 FROM clips
 WHERE suffix = $1
 `
+
+type GetClipRow struct {
+	Suffix       string
+	Rev          int64
+	Body         string
+	BodyBytes    int64
+	PasswordHash pgtype.Text
+	ExpiresAt    int64
+	CreatedAt    int64
+	UpdatedAt    int64
+}
 
 // ============================================================================
 //
 //	clip queries
 //
-//	Ownership is enforced IN the WHERE clause, never by a read-then-write in Go.
-//	A conditional UPDATE that matches nothing is indistinguishable from "no such
-//	suffix" and returns no rows, which is exactly the answer a non-owner should
-//	get — and it cannot race, because the check and the write are one statement.
-//	(This is the pattern teleport's store already uses; see the pitfall note
-//	about "code wrote it but the effect never happened".)
+//	归属：没有用户表，也没有「创建者」。`password_hash IS NULL` = 公开 clip，
+//	任何人都能写；非 NULL = 只有知道密码的人能写。密码**不是**在 SQL 里比较的
+//	（argon2 需要明文 + salt，只能在 Go 里算），但**判定仍然发生在写语句里**：
+//
+//	    调用方在 Go 里校验密码通过后，把「刚刚校验过的那个哈希」作为
+//	    @proof_hash 传进来，SQL 用
+//	        AND (password_hash IS NULL OR password_hash = @proof_hash)
+//	    作为写条件。
+//
+//	为什么不是 read-then-write：中间那一瞬间密码可能被改过。把校验过的哈希
+//	当条件带进语句，改过就是 0 行 —— 调用方得到 404，什么也没写。这与 0001 里
+//	「所有权判定写在 WHERE 里、一次语句完成」的初衷是同一条规则，只是判定值
+//	在 Go 里算出来而已。
+//
+//	公开 clip（password_hash IS NULL）走 `IS NULL` 那一支，所以不带任何凭据的
+//	写入是允许的 —— 这就是「无密码谁都能改」的实现，不是漏判。
 //
 // ============================================================================
-func (q *Queries) GetClip(ctx context.Context, suffix string) (Clip, error) {
+func (q *Queries) GetClip(ctx context.Context, suffix string) (GetClipRow, error) {
 	row := q.db.QueryRow(ctx, getClip, suffix)
-	var i Clip
+	var i GetClipRow
 	err := row.Scan(
 		&i.Suffix,
 		&i.Rev,
 		&i.Body,
 		&i.BodyBytes,
-		&i.OwnerHash,
+		&i.PasswordHash,
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -168,7 +220,7 @@ func (q *Queries) GetClip(ctx context.Context, suffix string) (Clip, error) {
 }
 
 const getLiveClip = `-- name: GetLiveClip :one
-SELECT suffix, rev, body, body_bytes, owner_hash, expires_at, created_at, updated_at
+SELECT suffix, rev, body, body_bytes, password_hash, expires_at, created_at, updated_at
 FROM clips
 WHERE suffix = $1
   AND (expires_at = 0 OR expires_at > $2)
@@ -179,18 +231,29 @@ type GetLiveClipParams struct {
 	NowMs  int64
 }
 
+type GetLiveClipRow struct {
+	Suffix       string
+	Rev          int64
+	Body         string
+	BodyBytes    int64
+	PasswordHash pgtype.Text
+	ExpiresAt    int64
+	CreatedAt    int64
+	UpdatedAt    int64
+}
+
 // A clip whose TTL has passed is gone as far as any reader is concerned, even
 // before the janitor deletes the row. Filtering here (rather than trusting the
 // janitor to have run) means an expired clip is never served.
-func (q *Queries) GetLiveClip(ctx context.Context, arg GetLiveClipParams) (Clip, error) {
+func (q *Queries) GetLiveClip(ctx context.Context, arg GetLiveClipParams) (GetLiveClipRow, error) {
 	row := q.db.QueryRow(ctx, getLiveClip, arg.Suffix, arg.NowMs)
-	var i Clip
+	var i GetLiveClipRow
 	err := row.Scan(
 		&i.Suffix,
 		&i.Rev,
 		&i.Body,
 		&i.BodyBytes,
-		&i.OwnerHash,
+		&i.PasswordHash,
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -257,6 +320,40 @@ func (q *Queries) ListAssetMeta(ctx context.Context, suffix string) ([]ListAsset
 	return items, nil
 }
 
+const setClipPassword = `-- name: SetClipPassword :execrows
+UPDATE clips
+SET password_hash = $1,
+    updated_at    = $2
+WHERE suffix = $3
+  AND (password_hash IS NULL OR password_hash = $4)
+`
+
+type SetClipPasswordParams struct {
+	PasswordHash pgtype.Text
+	NowMs        int64
+	Suffix       string
+	ProofHash    pgtype.Text
+}
+
+// Set a password on a public clip (this is the "claim": whoever sets one first
+// owns the clip), or replace the password on a protected one.
+//
+// `@proof_hash` is the hash the caller already verified in Go, or ” when the
+// clip is expected to be public. An empty string can never equal a real PHC
+// string, so a caller who supplies no password cannot touch a protected clip.
+func (q *Queries) SetClipPassword(ctx context.Context, arg SetClipPasswordParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setClipPassword,
+		arg.PasswordHash,
+		arg.NowMs,
+		arg.Suffix,
+		arg.ProofHash,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const statsTotals = `-- name: StatsTotals :one
 SELECT
   (SELECT COUNT(*) FROM clips)::BIGINT                            AS clip_count,
@@ -280,19 +377,19 @@ func (q *Queries) StatsTotals(ctx context.Context) (StatsTotalsRow, error) {
 const touchClipRev = `-- name: TouchClipRev :execrows
 UPDATE clips
 SET rev = rev + 1, updated_at = $1
-WHERE suffix = $2 AND owner_hash = $3
+WHERE suffix = $2 AND (password_hash IS NULL OR password_hash = $3)
 `
 
 type TouchClipRevParams struct {
 	NowMs     int64
 	Suffix    string
-	OwnerHash []byte
+	ProofHash pgtype.Text
 }
 
 // Bump rev without touching content. Used after an asset-only change, so a
 // waiting reader is woken and re-fetches.
 func (q *Queries) TouchClipRev(ctx context.Context, arg TouchClipRevParams) (int64, error) {
-	result, err := q.db.Exec(ctx, touchClipRev, arg.NowMs, arg.Suffix, arg.OwnerHash)
+	result, err := q.db.Exec(ctx, touchClipRev, arg.NowMs, arg.Suffix, arg.ProofHash)
 	if err != nil {
 		return 0, err
 	}
@@ -307,7 +404,7 @@ SET body       = $1,
     rev        = rev + 1,
     updated_at = $4
 WHERE suffix = $5
-  AND owner_hash = $6
+  AND (password_hash IS NULL OR password_hash = $6)
   AND (expires_at = 0 OR expires_at > $4)
 RETURNING rev, expires_at, created_at, updated_at
 `
@@ -318,7 +415,7 @@ type UpdateClipParams struct {
 	ExpiresAt int64
 	NowMs     int64
 	Suffix    string
-	OwnerHash []byte
+	ProofHash pgtype.Text
 }
 
 type UpdateClipRow struct {
@@ -328,9 +425,9 @@ type UpdateClipRow struct {
 	UpdatedAt int64
 }
 
-// Owner-checked, live-only update. No rows means: no such suffix, or not the
-// owner, or expired — all three are answered with the same 404 so the endpoint
-// is not an existence oracle.
+// No rows means: no such suffix, a password that does not match (or was not
+// supplied), or expired — all three are answered with the same 404 so the
+// endpoint is not an existence oracle for guessed suffixes.
 //
 // `expires_at` < 0 means "keep the current expiry": expressed here rather than
 // in Go so the decision needs no read-then-write round trip, and so an update
@@ -342,7 +439,7 @@ func (q *Queries) UpdateClip(ctx context.Context, arg UpdateClipParams) (UpdateC
 		arg.ExpiresAt,
 		arg.NowMs,
 		arg.Suffix,
-		arg.OwnerHash,
+		arg.ProofHash,
 	)
 	var i UpdateClipRow
 	err := row.Scan(

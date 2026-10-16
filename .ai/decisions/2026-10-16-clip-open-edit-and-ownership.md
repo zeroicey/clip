@@ -1,6 +1,6 @@
 # 无密码的 clip：谁都能改（取消 owner token 的独家写权限）
 
-**Status:** ✅ ACCEPTED —— 采纳 **A（无密码 = 谁都能改，密码是唯一凭证）**
+**Status:** ✅ ACCEPTED · **已实现**（`owner_token` 整套已删）—— 采纳 **A（无密码 = 谁都能改，密码是唯一凭证）**
 · **Date:** 2026-10-16 · **Deciders:** 用户（选了「A. 无密码谁都能改」，并确认为此删掉整个
 owner_token：字段 / `X-Relay-Clip-Token` 头 / localStorage / 契约测试）
 · **Supersedes:** clip 现有硬约定「读是匿名的，**写要 owner token**」

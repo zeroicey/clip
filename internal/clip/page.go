@@ -31,16 +31,25 @@ type pageData struct {
 	Nonce       string
 	Suffix      string
 	Rev         int64
-	State       string // "new" | "existing"
+	State       string // "new" | "existing" | "locked"
 	Base        string
 	Body        string
 	Assets      []AssetMeta
 	ExpiresText string
 	Hint        string
-	KeyState    string
-	// Editable is the server's view: a suffix nobody has claimed yet is
-	// editable by whoever got there first. The client refines this with the
-	// owner token it holds.
+	// HasPassword and PasswordState drive the "set a password" vs "change the
+	// password" choice, and tell the reader why anyone with the link can edit.
+	HasPassword   bool
+	PasswordState string
+	// Locked means the clip has a password and this response carries none of its
+	// content. The client asks for the password, then fetches the body over the
+	// API — the HTML is the one place protected text could otherwise leak into a
+	// browser that never proved it may see it.
+	Locked bool
+	// Editable is the server's view. With no password a clip is writable by
+	// whoever opens it (that is the documented model, not an oversight), so the
+	// server can answer this directly instead of asking the client to remember a
+	// token in localStorage.
 	Editable bool
 	CanWrite bool
 	// MaxAssetText is shown in error messages, so a person learns the limit
@@ -97,7 +106,12 @@ func newNonce() (string, error) {
 // answering "not found" would make the intended action look like an error. The
 // cost is that the response cannot distinguish "empty" from "absent"; nothing
 // in the response differs either way, so it leaks nothing new (the body of a
-// live clip is public to anyone who knows its suffix anyway).
+// live, unprotected clip is public to anyone who knows its suffix anyway).
+//
+// A clip that HAS a password is rendered as a locked shell: same page, same
+// shape, but no body and no asset list in it. That is the whole reason the
+// password is worth anything — if the text were rendered into the HTML and
+// merely hidden with CSS, the lock would be decoration.
 func renderPage(w http.ResponseWriter, cfg *Config, suffix string, clip *Clip) {
 	nonce, err := newNonce()
 	if err != nil {
@@ -106,31 +120,39 @@ func renderPage(w http.ResponseWriter, cfg *Config, suffix string, clip *Clip) {
 	}
 
 	data := pageData{
-		Nonce:        nonce,
-		Suffix:       suffix,
-		Base:         cfg.PublicBaseURL,
-		State:        "new",
-		Editable:     true,
-		CanWrite:     true,
-		KeyState:     "无（只能读）",
-		ExpiresText:  fmt.Sprintf("%d 小时后", int(cfg.DefaultTTL.Hours())),
-		MaxAssetText: humanBytes(cfg.MaxAssetBytes),
-		Hint: "这个后缀还没人用过 —— 写点东西，点保存，然后在另一台机器上打开同一个网址。" +
-			"后缀是公开的，别放密钥。",
+		Nonce:         nonce,
+		Suffix:        suffix,
+		Base:          cfg.PublicBaseURL,
+		State:         "new",
+		Editable:      true,
+		CanWrite:      true,
+		PasswordState: "公开（谁都能看、谁都能改）",
+		ExpiresText:   fmt.Sprintf("%d 小时后", int(cfg.DefaultTTL.Hours())),
+		MaxAssetText:  humanBytes(cfg.MaxAssetBytes),
+		Hint: "这个后缀还没人用过 —— 写点东西就会自动保存。" +
+			"不设密码的话，知道这个网址的人都能读、也能改；要独占就设一个密码。",
 	}
 
 	if clip != nil {
 		data.State = "existing"
-		data.Editable = false
-		data.CanWrite = false
 		data.Rev = clip.Rev
-		data.Body = clip.Body
-		data.Assets = clip.Assets
 		data.ExpiresText = expiresText(clip.ExpiresAt)
-		data.Hint = "只读。如果你是在另一台机器上，直接全选复制即可；" +
-			"想编辑需要这台浏览器持有创建时的编辑钥匙。"
-		if len(clip.Assets) > 0 {
-			data.Hint += fmt.Sprintf("（含 %d 张图片，可点开原图或用 /raw 链接下载。）", len(clip.Assets))
+		data.HasPassword = clip.HasPassword()
+		if clip.HasPassword() {
+			data.State = "locked"
+			data.Locked = true
+			data.Editable = false
+			data.CanWrite = false
+			data.PasswordState = "已设密码"
+			data.Hint = "这个剪贴板设了密码 —— 解锁之后才能看内容。"
+		} else {
+			data.Body = clip.Body
+			data.Assets = clip.Assets
+			data.Hint = "这个剪贴板是公开的：知道这个网址的人都能读、也能改。" +
+				"要独占就设一个密码。"
+			if len(clip.Assets) > 0 {
+				data.Hint += fmt.Sprintf("（含 %d 张图片，可点开原图或用 /raw 链接下载。）", len(clip.Assets))
+			}
 		}
 	}
 

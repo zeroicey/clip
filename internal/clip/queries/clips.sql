@@ -1,16 +1,26 @@
 -- ============================================================================
 --  clip queries
 --
---  Ownership is enforced IN the WHERE clause, never by a read-then-write in Go.
---  A conditional UPDATE that matches nothing is indistinguishable from "no such
---  suffix" and returns no rows, which is exactly the answer a non-owner should
---  get — and it cannot race, because the check and the write are one statement.
---  (This is the pattern teleport's store already uses; see the pitfall note
---  about "code wrote it but the effect never happened".)
+--  归属：没有用户表，也没有「创建者」。`password_hash IS NULL` = 公开 clip，
+--  任何人都能写；非 NULL = 只有知道密码的人能写。密码**不是**在 SQL 里比较的
+--  （argon2 需要明文 + salt，只能在 Go 里算），但**判定仍然发生在写语句里**：
+--
+--      调用方在 Go 里校验密码通过后，把「刚刚校验过的那个哈希」作为
+--      @proof_hash 传进来，SQL 用
+--          AND (password_hash IS NULL OR password_hash = @proof_hash)
+--      作为写条件。
+--
+--  为什么不是 read-then-write：中间那一瞬间密码可能被改过。把校验过的哈希
+--  当条件带进语句，改过就是 0 行 —— 调用方得到 404，什么也没写。这与 0001 里
+--  「所有权判定写在 WHERE 里、一次语句完成」的初衷是同一条规则，只是判定值
+--  在 Go 里算出来而已。
+--
+--  公开 clip（password_hash IS NULL）走 `IS NULL` 那一支，所以不带任何凭据的
+--  写入是允许的 —— 这就是「无密码谁都能改」的实现，不是漏判。
 -- ============================================================================
 
 -- name: GetClip :one
-SELECT suffix, rev, body, body_bytes, owner_hash, expires_at, created_at, updated_at
+SELECT suffix, rev, body, body_bytes, password_hash, expires_at, created_at, updated_at
 FROM clips
 WHERE suffix = $1;
 
@@ -18,7 +28,7 @@ WHERE suffix = $1;
 -- A clip whose TTL has passed is gone as far as any reader is concerned, even
 -- before the janitor deletes the row. Filtering here (rather than trusting the
 -- janitor to have run) means an expired clip is never served.
-SELECT suffix, rev, body, body_bytes, owner_hash, expires_at, created_at, updated_at
+SELECT suffix, rev, body, body_bytes, password_hash, expires_at, created_at, updated_at
 FROM clips
 WHERE suffix = $1
   AND (expires_at = 0 OR expires_at > @now_ms);
@@ -32,23 +42,28 @@ WHERE suffix = $1
 -- rows and the caller is told "taken" by a clip nobody can read. The WHERE on
 -- the DO UPDATE arm is what makes this atomic — a live row conflicts, matches
 -- nothing, and returns no rows.
-INSERT INTO clips (suffix, rev, body, body_bytes, owner_hash, expires_at, created_at, updated_at)
-VALUES (@suffix, 1, @body, @body_bytes, @owner_hash, @expires_at, @now_ms, @now_ms)
+--
+-- 新 clip 的 password_hash 由调用方给（NULL = 公开）。在**创建时**就能带上密码，
+-- 是为了避免「先建公开的、再设密码」中间那道缝：那道缝里内容对所有人可读，
+-- 而用户以为自己已经设成私有的了。接管一个过期行时同样用新值（EXCLUDED），
+-- 旧主人的密码不能顺延到新主人的 clip 上。
+INSERT INTO clips (suffix, rev, body, body_bytes, password_hash, expires_at, created_at, updated_at)
+VALUES (@suffix, 1, @body, @body_bytes, @password_hash, @expires_at, @now_ms, @now_ms)
 ON CONFLICT (suffix) DO UPDATE SET
-  rev         = 1,
-  body        = EXCLUDED.body,
-  body_bytes  = EXCLUDED.body_bytes,
-  owner_hash  = EXCLUDED.owner_hash,
-  expires_at  = EXCLUDED.expires_at,
-  created_at  = EXCLUDED.created_at,
-  updated_at  = EXCLUDED.updated_at
+  rev           = 1,
+  body          = EXCLUDED.body,
+  body_bytes    = EXCLUDED.body_bytes,
+  password_hash = EXCLUDED.password_hash,
+  expires_at    = EXCLUDED.expires_at,
+  created_at    = EXCLUDED.created_at,
+  updated_at    = EXCLUDED.updated_at
 WHERE clips.expires_at <> 0 AND clips.expires_at <= @now_ms
 RETURNING rev, expires_at, created_at, updated_at;
 
 -- name: UpdateClip :one
--- Owner-checked, live-only update. No rows means: no such suffix, or not the
--- owner, or expired — all three are answered with the same 404 so the endpoint
--- is not an existence oracle.
+-- No rows means: no such suffix, a password that does not match (or was not
+-- supplied), or expired — all three are answered with the same 404 so the
+-- endpoint is not an existence oracle for guessed suffixes.
 --
 -- `expires_at` < 0 means "keep the current expiry": expressed here rather than
 -- in Go so the decision needs no read-then-write round trip, and so an update
@@ -60,21 +75,43 @@ SET body       = @body,
     rev        = rev + 1,
     updated_at = @now_ms
 WHERE suffix = @suffix
-  AND owner_hash = @owner_hash
+  AND (password_hash IS NULL OR password_hash = @proof_hash)
   AND (expires_at = 0 OR expires_at > @now_ms)
 RETURNING rev, expires_at, created_at, updated_at;
 
 -- name: DeleteClip :execrows
 DELETE FROM clips
 WHERE suffix = @suffix
-  AND owner_hash = @owner_hash;
+  AND (password_hash IS NULL OR password_hash = @proof_hash);
 
 -- name: TouchClipRev :execrows
 -- Bump rev without touching content. Used after an asset-only change, so a
 -- waiting reader is woken and re-fetches.
 UPDATE clips
 SET rev = rev + 1, updated_at = @now_ms
-WHERE suffix = @suffix AND owner_hash = @owner_hash;
+WHERE suffix = @suffix AND (password_hash IS NULL OR password_hash = @proof_hash);
+
+-- name: SetClipPassword :execrows
+-- Set a password on a public clip (this is the "claim": whoever sets one first
+-- owns the clip), or replace the password on a protected one.
+--
+-- `@proof_hash` is the hash the caller already verified in Go, or '' when the
+-- clip is expected to be public. An empty string can never equal a real PHC
+-- string, so a caller who supplies no password cannot touch a protected clip.
+UPDATE clips
+SET password_hash = @password_hash,
+    updated_at    = @now_ms
+WHERE suffix = @suffix
+  AND (password_hash IS NULL OR password_hash = @proof_hash);
+
+-- name: ClearClipPassword :execrows
+-- Remove the password, making the clip public again. Requires proving the
+-- current password (or that there is none).
+UPDATE clips
+SET password_hash = NULL,
+    updated_at    = @now_ms
+WHERE suffix = @suffix
+  AND (password_hash IS NULL OR password_hash = @proof_hash);
 
 -- name: DeleteExpiredClips :execrows
 DELETE FROM clips

@@ -5,6 +5,12 @@
 把文本或者图片传过去……这个功能是给人用的，纯前端操作，不需要 AI 操作"）
 · **Supersedes:** none · **Related:** `2026-10-16-two-repositories.md`
 
+
+> ⚠️ **本文件已被部分取代（2026-10-16）**：D2（owner token）**整条废除** ——
+现在没有密码的 clip 谁都能改，密码是唯一凭据。见
+`.ai/decisions/2026-10-16-clip-open-edit-and-ownership.md` 与
+`2026-10-16-clip-access-password.md`。其余决策（技术栈、无构建步骤、长轮询、部署形态）仍然有效。
+
 ## 背景
 
 需求：在 `https://clip.hcyj.xyz/<任意后缀>` 打开一块写字板，写下内容保存，

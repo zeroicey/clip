@@ -4,15 +4,19 @@
 
 package clipdb
 
+import (
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
 type Clip struct {
-	Suffix    string
-	Rev       int64
-	Body      string
-	BodyBytes int64
-	OwnerHash []byte
-	ExpiresAt int64
-	CreatedAt int64
-	UpdatedAt int64
+	Suffix       string
+	Rev          int64
+	Body         string
+	BodyBytes    int64
+	ExpiresAt    int64
+	CreatedAt    int64
+	UpdatedAt    int64
+	PasswordHash pgtype.Text
 }
 
 type ClipAsset struct {

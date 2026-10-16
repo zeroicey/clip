@@ -50,6 +50,11 @@ type Config struct {
 
 	// WritePerHour is the per-source-IP write budget.
 	WritePerHour int
+	// UnlockPerHour bounds password GUESSES per source address and per suffix
+	// (see Server.clipAccess). Only failures are charged, so it needs to be high
+	// enough that an honest reader re-sending its password on every long poll
+	// never touches it — its whole job is to make guessing expensive.
+	UnlockPerHour int
 	// MaxTotalClips and MaxTotalBytes are the global ceilings. They are the
 	// actual backstop: a per-IP limit is a speed bump, and an attacker with a
 	// handful of addresses walks around it. When either ceiling is reached the
@@ -80,6 +85,7 @@ func Load() (*Config, error) {
 		MaxTotalClips: 20_000,    // ~20k clips
 		MaxTotalBytes: 1 << 30,   // 1 GiB in total
 		WritePerHour:  30,
+		UnlockPerHour: 20,
 		WritesEnabled: true,
 		DefaultTTL:    24 * time.Hour,
 		DBMaxConns:    8,
@@ -99,6 +105,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.WritePerHour, err = envInt("CLIP_WRITE_PER_HOUR", 30); err != nil {
+		return nil, err
+	}
+	if cfg.UnlockPerHour, err = envInt("CLIP_UNLOCK_PER_HOUR", 20); err != nil {
 		return nil, err
 	}
 	if cfg.MaxTotalClips, err = envInt64("CLIP_MAX_TOTAL_CLIPS", 20_000); err != nil {
@@ -129,6 +138,12 @@ func Load() (*Config, error) {
 	// writes"; that switch says what it means and can be flipped back.
 	if cfg.WritePerHour <= 0 {
 		return nil, fmt.Errorf("CLIP_WRITE_PER_HOUR must be positive (got %d)", cfg.WritePerHour)
+	}
+	// Non-positive would disable throttling entirely (ratelimit treats <= 0 as
+	// "unlimited"), which for a guessable secret is not a configuration a
+	// deployment should be able to reach by accident.
+	if cfg.UnlockPerHour <= 0 {
+		return nil, fmt.Errorf("CLIP_UNLOCK_PER_HOUR must be positive (got %d)", cfg.UnlockPerHour)
 	}
 	if cfg.DefaultTTL <= 0 {
 		return nil, fmt.Errorf("CLIP_DEFAULT_TTL must be positive (got %s)", cfg.DefaultTTL)

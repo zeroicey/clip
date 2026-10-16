@@ -55,6 +55,10 @@ func testStore(t *testing.T, mutate ...func(*Config)) *Store {
 		MaxTotalBytes: 1 << 30,
 		DefaultTTL:    24 * time.Hour,
 		WritePerHour:  30,
+		// Non-zero on purpose: a zero limit disables the limiter entirely
+		// (ratelimit treats <= 0 as "unlimited"), so a test config that left it out
+		// would silently stop exercising password throttling.
+		UnlockPerHour: 20,
 		WritesEnabled: true,
 	}
 	for _, m := range mutate {
@@ -74,9 +78,12 @@ func testStore(t *testing.T, mutate ...func(*Config)) *Store {
 	return st
 }
 
-func mustCreate(t *testing.T, st *Store, suffix, body, token string, expiresAt int64) {
+// mustCreate inserts a clip directly. `password` is the stored PHC hash, or nil
+// for a public clip — the same shape the store takes, so a test cannot
+// accidentally create a "protected" clip whose password is a plaintext string.
+func mustCreate(t *testing.T, st *Store, suffix, body string, password *string, expiresAt int64) {
 	t.Helper()
-	res, err := st.Create(context.Background(), suffix, body, hashOwnerToken(token), expiresAt)
+	res, err := st.Create(context.Background(), suffix, body, expiresAt, password)
 	if err != nil {
 		t.Fatalf("Create(%q): %v", suffix, err)
 	}
@@ -85,10 +92,21 @@ func mustCreate(t *testing.T, st *Store, suffix, body, token string, expiresAt i
 	}
 }
 
+// hashOf is the stored hash for a test password. Tests pass the hash around
+// because that — not the plaintext — is what the write queries take as proof.
+func hashOf(t *testing.T, plain string) string {
+	t.Helper()
+	h, err := hashPassword(plain)
+	if err != nil {
+		t.Fatalf("hashPassword: %v", err)
+	}
+	return h
+}
+
 func TestCreateAndGetRoundTrip(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	mustCreate(t, st, "ops1", "hello\nworld\n", "tok-1", 0)
+	mustCreate(t, st, "ops1", "hello\nworld\n", nil, 0)
 
 	got, err := st.Get(ctx, "ops1")
 	if err != nil {
@@ -103,19 +121,61 @@ func TestCreateAndGetRoundTrip(t *testing.T) {
 	if got.Rev != 1 {
 		t.Errorf("rev = %d, want 1", got.Rev)
 	}
+	// A clip created without a password is public. That is the documented model
+	// (anyone may read and write it), so it is asserted rather than assumed.
+	if got.HasPassword() {
+		t.Error("a clip created with no password reports one")
+	}
+	if got.PasswordHash != nil {
+		t.Errorf("password_hash = %q, want nil for a public clip", *got.PasswordHash)
+	}
 }
 
-// TestUpdateRequiresTheOwnerToken is the security boundary of the whole module:
-// a guessed suffix is readable but not writable. It also asserts the negative
-// case directly (the body is unchanged), because "the call returned an error" is
-// not the same claim as "nothing was written".
-func TestUpdateRequiresTheOwnerToken(t *testing.T) {
+// TestPublicClipIsWritableWithNoCredential is the new model in one test: with no
+// password there is nothing to present, and the write is allowed.
+//
+// It exists because the opposite was true until 2026-10-16 (a minted owner token
+// was required) and a regression to that behaviour would look like a bug report
+// about "can't save" rather than a security change.
+func TestPublicClipIsWritableWithNoCredential(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	mustCreate(t, st, "ops1", "the original", "owner-token", 0)
+	mustCreate(t, st, "ops1", "the original", nil, 0)
 
-	if _, err := st.Update(ctx, "ops1", hashOwnerToken("wrong-token"), "defaced", -1); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("update with a wrong token = %v, want ErrNotFound", err)
+	if _, err := st.Update(ctx, "ops1", "", "anyone may do this", -1); err != nil {
+		t.Fatalf("a public clip refused a credential-free update: %v", err)
+	}
+	got, err := st.Get(ctx, "ops1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "anyone may do this" || got.Rev != 2 {
+		t.Fatalf("after the update: body=%q rev=%d", got.Body, got.Rev)
+	}
+}
+
+// TestUpdateRequiresThePassword is the security boundary of the password model:
+// the proof travels INTO the UPDATE, so a wrong (or absent) one must match no
+// row. It asserts the negative case directly — the body is unchanged — because
+// "the call returned an error" is not the same claim as "nothing was written".
+func TestUpdateRequiresThePassword(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	mustCreate(t, st, "ops1", "the original", ptr(hashOf(t, "s3cret")), 0)
+
+	stored, err := st.Get(ctx, "ops1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.HasPassword() {
+		t.Fatal("setup: the clip has no password")
+	}
+
+	// Neither a wrong password nor no password at all may write.
+	for _, proof := range []string{"", hashOf(t, "wrong")} {
+		if _, err := st.Update(ctx, "ops1", proof, "defaced", -1); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("update with proof %q = %v, want ErrNotFound", proof, err)
+		}
 	}
 	got, err := st.Get(ctx, "ops1")
 	if err != nil {
@@ -128,32 +188,130 @@ func TestUpdateRequiresTheOwnerToken(t *testing.T) {
 		t.Fatalf("rev advanced on a refused update: %d", got.Rev)
 	}
 
-	if _, err := st.Update(ctx, "ops1", hashOwnerToken("owner-token"), "the fix", -1); err != nil {
-		t.Fatalf("update as the owner: %v", err)
+	// The proof is the hash that was verified, not a fresh hash of the same
+	// password: a second hash of "s3cret" is salted differently and must not
+	// match — which is what makes the check ":the row still holds what I
+	// verified", not ":someone knows this string".
+	if _, err := st.Update(ctx, "ops1", hashOf(t, "s3cret"), "wrong mechanism", -1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a re-hash of the same password was accepted: %v", err)
+	}
+
+	if _, err := st.Update(ctx, "ops1", *stored.PasswordHash, "the fix", -1); err != nil {
+		t.Fatalf("update with the stored hash: %v", err)
 	}
 	got, _ = st.Get(ctx, "ops1")
 	if got.Body != "the fix" || got.Rev != 2 {
-		t.Fatalf("after the owner's update: body=%q rev=%d, want %q/2", got.Body, got.Rev, "the fix")
+		t.Fatalf("after the authorised update: body=%q rev=%d, want %q/2", got.Body, got.Rev, "the fix")
 	}
 }
 
+// TestReKeyInvalidatesAnInFlightProof is the reason the proof goes into the
+// statement instead of being checked beforehand: between verifying a password
+// and writing with it, the password can change. The old proof must then match
+// nothing, so the write simply does not happen.
+func TestReKeyInvalidatesAnInFlightProof(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	mustCreate(t, st, "ops1", "original", ptr(hashOf(t, "first")), 0)
+
+	snapshot, err := st.Get(ctx, "ops1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified := *snapshot.PasswordHash // what a caller would have verified
+
+	// Someone re-keys the clip with the old password before our write lands.
+	if err := st.SetPassword(ctx, "ops1", verified, hashOf(t, "second")); err != nil {
+		t.Fatalf("re-key: %v", err)
+	}
+
+	if _, err := st.Update(ctx, "ops1", verified, "stale writer", -1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a proof verified before the re-key was accepted after it: %v", err)
+	}
+	got, _ := st.Get(ctx, "ops1")
+	if got.Body != "original" {
+		t.Fatalf("a stale proof wrote: %q", got.Body)
+	}
+}
+
+// TestSetPasswordClaimsAPublicClip pins the "first one to set a password owns
+// it" rule, including the part that is easy to forget: the claim needs no
+// credential (there is none to give), and it locks out everyone else.
+func TestSetPasswordClaimsAPublicClip(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	mustCreate(t, st, "ops1", "public notes", nil, 0)
+
+	if err := st.SetPassword(ctx, "ops1", "", hashOf(t, "mine")); err != nil {
+		t.Fatalf("claiming a public clip: %v", err)
+	}
+	got, err := st.Get(ctx, "ops1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasPassword() {
+		t.Fatal("the clip is still public after being claimed")
+	}
+
+	// A second claimer with no credential is refused: the suffix is taken now.
+	if err := st.SetPassword(ctx, "ops1", "", hashOf(t, "yours")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a second claim on a protected clip = %v, want ErrNotFound", err)
+	}
+	// And a write without the password is refused too.
+	if _, err := st.Update(ctx, "ops1", "", "hijack", -1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("write on a claimed clip = %v, want ErrNotFound", err)
+	}
+}
+
+// TestClearPasswordReopensTheClip is the way back: proving the password makes
+// the clip public again, and then anyone may write it.
+func TestClearPasswordReopensTheClip(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	mustCreate(t, st, "ops1", "private", ptr(hashOf(t, "mine")), 0)
+
+	if err := st.ClearPassword(ctx, "ops1", ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("clearing without the password = %v, want ErrNotFound", err)
+	}
+	got, _ := st.Get(ctx, "ops1")
+	if !got.HasPassword() {
+		t.Fatal("an unauthorised clear removed the password")
+	}
+
+	if err := st.ClearPassword(ctx, "ops1", *got.PasswordHash); err != nil {
+		t.Fatalf("clearing with the password: %v", err)
+	}
+	got, _ = st.Get(ctx, "ops1")
+	if got.HasPassword() {
+		t.Fatal("the password survived a clear")
+	}
+	if _, err := st.Update(ctx, "ops1", "", "anyone again", -1); err != nil {
+		t.Fatalf("the reopened clip refused a credential-free write: %v", err)
+	}
+}
+
+// ptr is a convenience for the optional password hash the store takes.
+func ptr(s string) *string { return &s }
+
 // TestCreateOnALiveSuffixIsRefused proves the create path cannot be used as a
-// back door to overwrite somebody else's clip.
+// back door to overwrite a live clip — not even a public one, where the attempt
+// comes from someone who is allowed to write it: claiming an existing suffix is
+// an UPDATE, and Create is only for a suffix nobody is using.
 func TestCreateOnALiveSuffixIsRefused(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	mustCreate(t, st, "ops1", "the original", "owner-token", 0)
+	mustCreate(t, st, "ops1", "the original", nil, 0)
 
-	if _, err := st.Create(ctx, "ops1", "hijacked", hashOwnerToken("other"), 0); !errors.Is(err, ErrTaken) {
+	if _, err := st.Create(ctx, "ops1", "hijacked", 0, nil); !errors.Is(err, ErrTaken) {
 		t.Fatalf("Create on a live suffix = %v, want ErrTaken", err)
 	}
 	got, _ := st.Get(ctx, "ops1")
 	if got.Body != "the original" {
 		t.Fatalf("body was overwritten: %q", got.Body)
 	}
-	// The original token still works, i.e. the failed takeover did not rotate it.
-	if _, err := st.Update(ctx, "ops1", hashOwnerToken("owner-token"), "still mine", -1); err != nil {
-		t.Fatalf("the original owner lost write access: %v", err)
+	// The clip is still public, i.e. the refused create did not make it private.
+	if got.HasPassword() {
+		t.Fatal("a refused create changed the clip's protection")
 	}
 }
 
@@ -161,46 +319,57 @@ func TestCreateOnALiveSuffixIsRefused(t *testing.T) {
 // expired row still occupies its suffix until the janitor runs. Without the
 // takeover, a suffix that expired a second ago would be permanently unusable —
 // "taken" by a clip nobody can read.
+//
+// It also pins that the takeover does NOT carry the old password over: a new
+// occupant inherits an empty, public clip, or the previous holder's secret would
+// outlive their clip.
 func TestExpiredSuffixBecomesReusable(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	past := time.Now().Add(-time.Hour).UnixMilli()
-	mustCreate(t, st, "ops1", "old content", "old-token", past)
+	mustCreate(t, st, "ops1", "old content", ptr(hashOf(t, "old-secret")), past)
 
 	if _, err := st.Get(ctx, "ops1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an expired clip is still readable: %v", err)
 	}
-	// The old owner cannot update it either: expiry is expiry.
-	if _, err := st.Update(ctx, "ops1", hashOwnerToken("old-token"), "zombie", -1); !errors.Is(err, ErrNotFound) {
+	// The old password cannot resurrect it either: expiry is expiry.
+	if _, err := st.Update(ctx, "ops1", hashOf(t, "old-secret"), "zombie", -1); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an expired clip accepted an update: %v", err)
 	}
 
-	if _, err := st.Create(ctx, "ops1", "new content", hashOwnerToken("new-token"), 0); err != nil {
+	if _, err := st.Create(ctx, "ops1", "new content", 0, nil); err != nil {
 		t.Fatalf("reusing an expired suffix: %v", err)
 	}
 	got, err := st.Get(ctx, "ops1")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got.HasPassword() {
+		t.Error("the new occupant inherited the previous holder's password")
+	}
+	if _, err := st.Update(ctx, "ops1", "", "the new occupant writes", -1); err != nil {
+		t.Fatalf("the reused suffix is not publicly writable: %v", err)
+	}
 	if got.Body != "new content" || got.Rev != 1 {
 		t.Fatalf("after takeover: body=%q rev=%d, want %q/1", got.Body, got.Rev, "new content")
 	}
-	// The previous owner must be locked out.
-	if _, err := st.Update(ctx, "ops1", hashOwnerToken("old-token"), "zombie", -1); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("the old owner still has write access after a takeover: %v", err)
-	}
+	// There is deliberately no "the previous holder is locked out" assertion
+	// here any more: a taken-over suffix is a NEW public clip, so the previous
+	// holder has no standing to be locked out of — they are exactly as much a
+	// stranger to it as anyone else. What matters was asserted above: the
+	// password did not carry over.
 }
 
 // TestTakeoverClearsTheOldOwnersImages is the guard for the ON DELETE CASCADE
 // that does NOT fire: a takeover is an UPDATE, so without an explicit delete the
-// new owner would inherit the previous owner's images.
+// new holder would inherit the previous one's images.
 func TestTakeoverClearsTheOldOwnersImages(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	past := time.Now().Add(-time.Hour).UnixMilli()
-	mustCreate(t, st, "ops1", "old", "old-token", past)
+	mustCreate(t, st, "ops1", "old", ptr(hashOf(t, "old-secret")), past)
 
-	if _, err := st.SetAssets(ctx, "ops1", hashOwnerToken("old-token"),
+	if _, err := st.SetAssets(ctx, "ops1", "",
 		[]Asset{{Position: 0, Mime: "image/png", Bytes: pngBytes()}}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("SetAssets on an expired clip = %v, want ErrNotFound", err)
 	}
@@ -209,8 +378,8 @@ func TestTakeoverClearsTheOldOwnersImages(t *testing.T) {
 	if _, err := st.Sweep(ctx); err != nil {
 		t.Fatal(err)
 	}
-	mustCreate(t, st, "ops2", "live", "tok-live", 0)
-	if _, err := st.SetAssets(ctx, "ops2", hashOwnerToken("tok-live"),
+	mustCreate(t, st, "ops2", "live", nil, 0)
+	if _, err := st.SetAssets(ctx, "ops2", "",
 		[]Asset{{Position: 0, Mime: "image/png", Bytes: pngBytes()}}); err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +387,7 @@ func TestTakeoverClearsTheOldOwnersImages(t *testing.T) {
 	if _, err := st.Pool().Exec(ctx, `UPDATE clips SET expires_at = $1 WHERE suffix = 'ops2'`, past); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Create(ctx, "ops2", "fresh", hashOwnerToken("tok-new"), 0); err != nil {
+	if _, err := st.Create(ctx, "ops2", "fresh", 0, nil); err != nil {
 		t.Fatalf("takeover: %v", err)
 	}
 	got, err := st.Get(ctx, "ops2")
@@ -226,16 +395,16 @@ func TestTakeoverClearsTheOldOwnersImages(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got.Assets) != 0 {
-		t.Fatalf("the new owner inherited %d image(s) from the old one", len(got.Assets))
+		t.Fatalf("the new holder inherited %d image(s) from the old one", len(got.Assets))
 	}
 }
 
 func TestQuotaStopsWrites(t *testing.T) {
 	st := testStore(t, func(c *Config) { c.MaxTotalClips = 1 })
 	ctx := context.Background()
-	mustCreate(t, st, "one", "x", "t1", 0)
+	mustCreate(t, st, "one", "x", nil, 0)
 
-	if _, err := st.Create(ctx, "two", "y", hashOwnerToken("t2"), 0); !errors.Is(err, ErrQuota) {
+	if _, err := st.Create(ctx, "two", "y", 0, nil); !errors.Is(err, ErrQuota) {
 		t.Fatalf("Create past the clip quota = %v, want ErrQuota", err)
 	}
 	// The failed attempt must not have written anything.
@@ -247,9 +416,9 @@ func TestQuotaStopsWrites(t *testing.T) {
 func TestQuotaStopsWritesByBytes(t *testing.T) {
 	st := testStore(t, func(c *Config) { c.MaxTotalBytes = 10 })
 	ctx := context.Background()
-	mustCreate(t, st, "one", "0123456789", "t1", 0)
+	mustCreate(t, st, "one", "0123456789", nil, 0)
 
-	if _, err := st.Create(ctx, "two", "x", hashOwnerToken("t2"), 0); !errors.Is(err, ErrQuota) {
+	if _, err := st.Create(ctx, "two", "x", 0, nil); !errors.Is(err, ErrQuota) {
 		t.Fatalf("Create past the byte quota = %v, want ErrQuota", err)
 	}
 }
@@ -259,9 +428,9 @@ func TestSweepDeletesOnlyExpired(t *testing.T) {
 	ctx := context.Background()
 	past := time.Now().Add(-time.Hour).UnixMilli()
 	future := time.Now().Add(time.Hour).UnixMilli()
-	mustCreate(t, st, "gone", "a", "t1", past)
-	mustCreate(t, st, "stays", "b", "t2", future)
-	mustCreate(t, st, "forever", "c", "t3", 0)
+	mustCreate(t, st, "gone", "a", nil, past)
+	mustCreate(t, st, "stays", "b", nil, future)
+	mustCreate(t, st, "forever", "c", nil, 0)
 
 	n, err := st.Sweep(ctx)
 	if err != nil {
@@ -280,9 +449,9 @@ func TestSweepDeletesOnlyExpired(t *testing.T) {
 func TestSetAssetsReplacesWholesaleAndBumpsRev(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	mustCreate(t, st, "ops1", "text", "tok", 0)
+	mustCreate(t, st, "ops1", "text", nil, 0)
 
-	res, err := st.SetAssets(ctx, "ops1", hashOwnerToken("tok"), []Asset{
+	res, err := st.SetAssets(ctx, "ops1", "", []Asset{
 		{Position: 0, Mime: "image/png", Bytes: pngBytes()},
 		{Position: 1, Mime: "image/jpeg", Bytes: jpegBytes()},
 	})
@@ -302,7 +471,7 @@ func TestSetAssetsReplacesWholesaleAndBumpsRev(t *testing.T) {
 	}
 
 	// Replacing with one image must leave exactly one, not three or two.
-	res, err = st.SetAssets(ctx, "ops1", hashOwnerToken("tok"), []Asset{
+	res, err = st.SetAssets(ctx, "ops1", "", []Asset{
 		{Position: 0, Mime: "image/webp", Bytes: pngBytes()},
 	})
 	if err != nil {
@@ -320,14 +489,23 @@ func TestSetAssetsReplacesWholesaleAndBumpsRev(t *testing.T) {
 	}
 }
 
-func TestSetAssetsRequiresTheOwnerToken(t *testing.T) {
+// TestSetAssetsRequiresThePassword: the image set is behind the same password as
+// the text. Leaving it open would let anyone with the link replace a private
+// clip's screenshots while being unable to read them.
+func TestSetAssetsRequiresThePassword(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	mustCreate(t, st, "ops1", "text", "tok", 0)
+	mustCreate(t, st, "ops1", "text", ptr(hashOf(t, "s3cret")), 0)
 
-	if _, err := st.SetAssets(ctx, "ops1", hashOwnerToken("nope"),
-		[]Asset{{Position: 0, Mime: "image/png", Bytes: pngBytes()}}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("SetAssets with a wrong token = %v, want ErrNotFound", err)
+	stored, err := st.Get(ctx, "ops1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, proof := range []string{"", hashOf(t, "nope")} {
+		if _, err := st.SetAssets(ctx, "ops1", proof,
+			[]Asset{{Position: 0, Mime: "image/png", Bytes: pngBytes()}}); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("SetAssets with proof %q = %v, want ErrNotFound", proof, err)
+		}
 	}
 	got, _ := st.Get(ctx, "ops1")
 	if len(got.Assets) != 0 {
@@ -335,6 +513,12 @@ func TestSetAssetsRequiresTheOwnerToken(t *testing.T) {
 	}
 	if got.Rev != 1 {
 		t.Fatalf("rev moved on a refused SetAssets: %d", got.Rev)
+	}
+	// With the password, it works — otherwise the previous assertions would pass
+	// for the wrong reason ("nothing ever works" is not "the check works").
+	if _, err := st.SetAssets(ctx, "ops1", *stored.PasswordHash,
+		[]Asset{{Position: 0, Mime: "image/png", Bytes: pngBytes()}}); err != nil {
+		t.Fatalf("SetAssets with the password: %v", err)
 	}
 }
 
@@ -344,10 +528,10 @@ func TestSetAssetsRequiresTheOwnerToken(t *testing.T) {
 func TestRevChangesEvenWhenTheBodyDoesNot(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	mustCreate(t, st, "ops1", "same", "tok", 0)
+	mustCreate(t, st, "ops1", "same", nil, 0)
 	before, _ := st.Get(ctx, "ops1")
 
-	if _, err := st.Update(ctx, "ops1", hashOwnerToken("tok"), "same", -1); err != nil {
+	if _, err := st.Update(ctx, "ops1", "", "same", -1); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := st.Get(ctx, "ops1")
@@ -360,9 +544,9 @@ func TestUpdateKeepsExpiryWhenNotMentioned(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	deadline := time.Now().Add(48 * time.Hour).UnixMilli()
-	mustCreate(t, st, "ops1", "x", "tok", deadline)
+	mustCreate(t, st, "ops1", "x", nil, deadline)
 
-	if _, err := st.Update(ctx, "ops1", hashOwnerToken("tok"), "y", -1); err != nil {
+	if _, err := st.Update(ctx, "ops1", "", "y", -1); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := st.Get(ctx, "ops1")
@@ -370,7 +554,7 @@ func TestUpdateKeepsExpiryWhenNotMentioned(t *testing.T) {
 		t.Fatalf("expiry moved on an update that did not mention it: %d -> %d", deadline, got.ExpiresAt)
 	}
 	// And an explicit 0 means forever.
-	if _, err := st.Update(ctx, "ops1", hashOwnerToken("tok"), "z", 0); err != nil {
+	if _, err := st.Update(ctx, "ops1", "", "z", 0); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = st.Get(ctx, "ops1")
@@ -379,22 +563,30 @@ func TestUpdateKeepsExpiryWhenNotMentioned(t *testing.T) {
 	}
 }
 
-func TestDeleteRequiresTheOwnerToken(t *testing.T) {
+func TestDeleteRequiresThePassword(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	mustCreate(t, st, "ops1", "text", "tok", 0)
+	mustCreate(t, st, "ops1", "text", ptr(hashOf(t, "s3cret")), 0)
 
-	if ok, err := st.Delete(ctx, "ops1", hashOwnerToken("nope")); err != nil || ok {
-		t.Fatalf("Delete with a wrong token = %v/%v, want false/nil", ok, err)
+	stored, err := st.Get(ctx, "ops1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No credential and a wrong one are both refused, and the clip survives both.
+	for _, proof := range []string{"", hashOf(t, "nope")} {
+		if ok, err := st.Delete(ctx, "ops1", proof); err != nil || ok {
+			t.Fatalf("Delete with proof %q = %v/%v, want false/nil", proof, ok, err)
+		}
 	}
 	if _, err := st.Get(ctx, "ops1"); err != nil {
 		t.Fatalf("a refused delete removed the clip: %v", err)
 	}
-	if ok, err := st.Delete(ctx, "ops1", hashOwnerToken("tok")); err != nil || !ok {
-		t.Fatalf("Delete as the owner = %v/%v, want true/nil", ok, err)
+
+	if ok, err := st.Delete(ctx, "ops1", *stored.PasswordHash); err != nil || !ok {
+		t.Fatalf("Delete with the password = %v/%v, want true/nil", ok, err)
 	}
 	if _, err := st.Get(ctx, "ops1"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("the clip survived its owner's delete: %v", err)
+		t.Fatalf("the clip survived a delete with the right password: %v", err)
 	}
 }
 
