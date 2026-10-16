@@ -1,7 +1,9 @@
 # 部署 clip（线上已就绪）
 
 **Applies to:** clip 服务（后端在 `hpcore`，公网入口在 `hcyj`）
-· **Owner:** lead · **Last verified:** 2026-10-16（证书已签发、公网 27/27 真浏览器 + 大陆观测点全绿）
+· **Owner:** lead · **Last verified:** 2026-10-16（证书已签发、公网 27/27 真浏览器 + 大陆观测点全绿）；
+同日第二会话：修复 HEAD 掉进 NoRoute 后重新部署（`13ad95d`），三条检查 + d) 契约 9/9 +
+真浏览器 27/27 + hcyj/koma 观测点全绿
 
 ## 形态
 
@@ -75,8 +77,12 @@ curl -sI -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/robots.txt    # 
 curl -s -X POST -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/ops1    # 405（公共路径只服务 GET/HEAD）
 
 # g) 部署产物能追溯到提交（见「已知约束」里线上那版无法复现的事）
-git -C <clip repo> status --porcelain                                          # 必须为空
-curl -s https://clip.hcyj.xyz/api/health | grep -o '"version":"[^"]*"'      # 必须 = 本次提交，且不带 -dirty
+git -C <clip repo> status --porcelain                                          # 构建前必须为空
+V=$(curl -s https://clip.hcyj.xyz/api/health | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+git -C <clip repo> cat-file -e "$V"                                            # 这个提交必须在历史里（-dirty 会在这里挂）
+git -C <clip repo> diff --stat "$V"..HEAD -- cmd/ internal/ scripts/           # 之后没有代码改动
+# 注意比的是「$V 之后没有代码改动」，不是「$V == HEAD」：部署后的纯文档提交
+# （.ai/ 之类）本来就会让 HEAD 往前走，做到等号就等于禁止事后写记忆库。
 
 # e) 真库测试
 TEST_PG_DSN=... scripts/test-pg.sh
@@ -107,11 +113,24 @@ sudo systemctl restart clip     # 读/raw/图片照旧，PUT/POST/DELETE 返回 
 ## 回滚
 
 ```bash
-sudo install -m 0750 -o relay -g relay <上一个二进制> /data/services/clip/clip
+# 当前（至少）有一份旧二进制在这里：/data/backups/clip-binary-57dd925-dirty
+#   （sha256 5893fd10df35164a9b121d9cc16ec81ad0f7e181f039bf2cf6d62def599102e0，即修 HEAD 之前）
+sudo install -m 0750 -o relay -g relay /data/backups/<上一个二进制> /data/services/clip/clip
 sudo systemctl restart clip
 # 若本次带了迁移：
 docker exec -i -e PGPASSWORD="$PW" postgres pg_restore -U relay -d relay --clean --if-exists < <dump>
 ```
+
+**升级前先冷备**（上面的部署步骤里已经包含）。备份到底能不能用要验一下 —— 至少让它能解析：
+
+```bash
+# 不能 `pg_restore -l -`：CUSTOM 格式需要可寻址的文件，管道会报 cannot open "-"
+sudo docker cp /data/backups/<dump> postgres:/tmp/verify.dump
+sudo docker exec postgres pg_restore -l /tmp/verify.dump | head    # 有 TOC 列表 = 归档可读
+sudo docker exec postgres rm -f /tmp/verify.dump
+```
+
+（`pg_restore` 真的恢复到库里的演练**仍未做过**，见 CURRENT_TASK 的运维缺口。）
 
 ## 证书相关（DNS 改过之后）
 
@@ -127,12 +146,11 @@ docker exec caddy ls /data/caddy/certificates/acme-v02.api.letsencrypt.org-direc
 
 ## 已知约束
 
-- **线上跑的二进制版本是 `57dd925-dirty`，本仓库历史里没有这个提交。** clip 在 2026-10-16
-  拆成独立仓库时历史被重写成一个全新提交（`f4c33aa`），而线上那版是在拆分之前、**工作区脏**
-  的状态下构建的。实测：二进制里嵌入的页面与仓库逐字节一致、依赖一致、方法/状态码矩阵只差
-  本次修的 HEAD 与 405（7 个单元格，其余全同）—— 但它**无法从任何提交复现**。
-  所以：**只从干净工作区构建**，部署后用验证的 g) 步核对版本号（当年就是因为没核对，
-  线上版本与仓库的对应关系只能靠事后反推）。
+- **线上二进制的版本必须能在本仓库里找到。** 2026-10-16 那次事故：线上嵌的是
+  `57dd9257a1d6+dirty`，本仓库历史里根本没这个提交（拆分重写过历史，而那版是脏工作区
+  构建的），于是「线上跑的到底是哪份代码」只能靠事后反推（实测：嵌入页面逐字节一致、依赖一致、
+  方法/状态码矩阵只差当时还没修的 HEAD 与 405）。现已换成 `13ad95d`（干净树）。
+  所以：**只从干净工作区构建**，部署后用验证的 g) 步核对。
 - **本机关机 = 服务不可用**，hcyj 上不会降级。这是「后端放本机」的直接代价。
 - **Caddy 站点级 `log` 会明文记录 `X-Relay-Clip-Token`**（Caddy 默认只脱敏
   `Authorization`/`Cookie`）。要开日志必须同时过滤：
