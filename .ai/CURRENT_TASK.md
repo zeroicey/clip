@@ -1,10 +1,24 @@
 # Current task
 
-**Status:** ✅ **步骤 ② 已上线并验证** —— 定位 = **webnote.cc 的开源版本**。
-线上 = **`172ea54`**（干净工作区构建，可追溯）。
-步骤 ①（密码 + MIT LICENSE + 自动保存）与步骤 ②（只读分享链接 `/s/<token>`）都已上线。
-**下一步 = 未排期**（见下方「未做」：`pg_restore` 恢复演练仍最大缺口）。
-**Updated:** 2026-10-16（第三会话）
+**Status:** ✅ **步骤 ② 已上线并验证**；**下一步 = 美化 UI（已交接）** —— 定位 = **webnote.cc 的开源版本**。
+线上 = **`172ea54`**（干净工作区构建，可追溯）。步骤 ①（密码 + MIT LICENSE + 自动保存）与
+步骤 ②（只读分享链接 `/s/<token>`）都已上线。
+**更新：** 2026-10-16（第三会话）· **交接文档：** `.ai/sessions/2026-10-16-ui-beautification-handoff.md`
+
+## 下一步：美化 UI（下一个会话）
+
+用户指定：**下一个对话美化 UI**。先读
+`.ai/sessions/2026-10-16-ui-beautification-handoff.md` —— 它的「Do not repeat」一节
+是有用的东西（CSP 会挡内联 `style=`、别弄丢 `[hidden]` 规则、一个模板两种形态、
+被脚本钉住的 id/文案、textarea 的 `white-space:pre` 是刻意的）。
+
+要动的地方：`internal/clip/page.html`（`<style nonce>` L12–106 + 标记）与
+`internal/clip/page.go` 的 `landingHTML`（首页，L339+）。仓库里已有可直接用的技能：
+`.agents/skills/web-design-guidelines/`、`.agents/skills/accessibility-review/`。
+
+**完成定义不变**：`scripts/check.sh` 全绿 + 真库 `scripts/test-pg.sh` +
+**真浏览器**（`node scripts/verify-clip-browser.cjs`，本地 75/75 后部署、再打一次线上）+
+`git commit`/部署前先问人类。
 
 ### 步骤 ② 部署后的线上验证（都是实跑）
 

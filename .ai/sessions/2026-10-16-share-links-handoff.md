@@ -1,5 +1,12 @@
 # 分享链接（步骤 ②）— 交接
 
+> **已落地（2026-10-16 第三会话）。** 本文档是当时的**计划**，现已全部实现并上线：
+> 线上 `172ea54`，迁移 `0003_clip_shares.sql`，真浏览器打线上 75/75 ×2。
+> 下面「步骤 ② 未开工」之类的说法已是历史；**当前状态看
+> `.ai/CURRENT_TASK.md` 与 `.ai/sessions/2026-10-16-ui-beautification-handoff.md`。**
+> 落地时定下的细节（“不泄漏存在性”让位、三种口令形态、取件码 TTL 上界、接管清分享等）
+> 已写进 `.ai/decisions/2026-10-16-clip-share-links.md` 的「落地补充」。
+
 **Date:** 2026-10-16 · **Branch/Commit:** `main @ fbddae5`（线上跑 `9126d5c`）· **Duration:** 一个长会话（步骤 ① 全过程）
 
 ## Where we ended
