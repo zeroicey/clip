@@ -1,0 +1,32 @@
+---
+name: remember-decision
+description: 'Capture a proposal or an accepted decision in .ai/decisions/YYYY-MM-DD-<topic>.md with the 💭 PROPOSAL → ✅ ACCEPTED → 🪦 REJECTED status machine, options and consequences. Use when a choice is expensive to reverse, when the user asks for a plan/RFC/ADR, or when brainstorming a direction before implementation.'
+---
+
+Capture one decision with enough alternatives and consequences that it is never
+re-litigated from scratch. This replaces ad-hoc ideas directories and ad-hoc chat plans.
+
+ARGUMENTS: `<ARGUMENTS>` is the topic slug. If absent, derive it from the choice under discussion.
+
+## Procedure
+
+1. Separate the **context** (facts, constraints, deadlines) from the **proposal** (a preference).
+   If the user has not chosen yet, write `💭 PROPOSAL` — an unratified idea is a proposal, not a plan.
+2. List the real options, at least two, in a table: upside, downside, reversibility. Do not invent
+   options to pad the table; if there is genuinely one, say why the alternatives were rejected.
+3. Write `.ai/decisions/YYYY-MM-DD-<topic>.md` from `.ai/decisions/_TEMPLATE.md`.
+4. On acceptance, flip line 1 to `✅ ACCEPTED`, state the decision as a rule, and list the
+   consequences plus what must now be true. Never delete a rejected option — that is the value.
+5. If it supersedes an earlier decision, add `Supersedes:` pointing at that file and flip the older
+   one to `🪦 REJECTED` with a pointer forward.
+6. Give the decision a "Revisit when" trigger, an observable condition, not "if it stops working".
+
+## Rules
+
+- One decision per file. If it needs an "and", it is two files.
+- Record rejected ideas. The cheapest future win is knowing what was already ruled out.
+- Never store implementation steps here; those belong in `.ai/CURRENT_TASK.md`.
+
+## Output to the user
+
+File path, status, and the question still open (if PROPOSAL) that needs a verdict.

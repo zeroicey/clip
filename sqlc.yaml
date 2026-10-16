@@ -1,0 +1,20 @@
+---
+version: "2"
+sql:
+  - engine: "postgresql"
+    # The migrations ARE the schema: sqlc reads the same files the server
+    # applies at startup, so a query that type-checks here cannot be checking
+    # against a schema that differs from the one that will run.
+    schema: "internal/clip/migrations"
+    queries: "internal/clip/queries"
+    gen:
+      go:
+        package: "clipdb"
+        out: "internal/clip/clipdb"
+        sql_package: "pgx/v5"
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_empty_slices: true
+        # Timestamps are epoch milliseconds (BIGINT), not timestamptz: the
+        # project-wide convention. Nothing here should ever grow a *time.Time.
+        emit_pointers_for_null_types: false

@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- A clipboard suffix is personal-by-obscurity at best, and a crawled suffix
+     is a suffix a stranger can read. Keep every agent out. -->
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>{{.Suffix}} · Relay 网络剪贴板</title>
+<style nonce="{{.Nonce}}">
+/* Deliberately self-contained: no webfont, no shared stylesheet, no build step.
+   This page has to render on whatever machine happens to have a browser, so it
+   depends on nothing but the HTML the server just sent. */
+:root{
+  --bg:#f6f7f9; --fg:#14161a; --muted:#5c6470; --line:#d8dce3;
+  --card:#fff; --accent:#1f6feb; --accent-fg:#fff; --warn:#a3520a; --err:#b3261e;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0f1115;--fg:#e8eaee;--muted:#9aa3b0;--line:#272c34;--card:#161a20;
+        --accent:#4c8dff;--accent-fg:#0b0d10;--warn:#e0a458;--err:#ff6b60;}
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--bg);color:var(--fg);
+  font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
+  display:flex;flex-direction:column;
+}
+header{
+  display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;
+  padding:14px 18px;border-bottom:1px solid var(--line);
+}
+.brand{font-weight:650;text-decoration:none;color:inherit}
+.brand span{color:var(--muted);font-weight:400;font-size:13px}
+.addr{
+  font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,"JetBrains Mono",monospace;
+  color:var(--muted);word-break:break-all;
+}
+main{flex:1;display:flex;flex-direction:column;gap:12px;padding:16px 18px 28px;min-height:0}
+.hint{margin:0;color:var(--muted);font-size:13.5px}
+.hint b{color:var(--warn);font-weight:600}
+textarea{
+  flex:1;min-height:220px;width:100%;resize:vertical;
+  padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--card);
+  color:var(--fg);
+  font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,"JetBrains Mono",monospace;
+  /* A transfer buffer is expected to hold lines that must not be re-wrapped:
+     a reflowed log line or command is a subtly corrupted one. */
+  white-space:pre;overflow:auto;tab-size:4;
+}
+textarea:read-only{background:color-mix(in srgb,var(--card) 70%,var(--bg))}
+textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+button,label.file{
+  appearance:none;border:1px solid var(--line);background:var(--card);color:var(--fg);
+  border-radius:8px;padding:9px 14px;font:inherit;font-size:14px;cursor:pointer;
+  /* 32px minimum: the accessibility pass on the dashboard settled on this, and a
+     touch device is a plausible second machine for this feature. */
+  min-height:36px;
+}
+button:hover,label.file:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
+button[hidden],label[hidden]{display:none}
+button:disabled{opacity:.5;cursor:default}
+.status{margin:0;font-size:13.5px;color:var(--muted);min-height:1.4em}
+.status[data-tone=err]{color:var(--err)}
+.status[data-tone=ok]{color:var(--accent)}
+figure{margin:0}
+.thumbs{display:flex;gap:10px;flex-wrap:wrap}
+.thumbs img{
+  max-width:220px;max-height:150px;border:1px solid var(--line);border-radius:8px;
+  background:var(--card);display:block;
+}
+details.meta{border-top:1px solid var(--line);padding-top:10px;font-size:13px;color:var(--muted)}
+details.meta summary{cursor:pointer}
+.meta dl{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:10px 0 0}
+.meta dt{color:var(--muted)}
+.meta dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+.keybox{
+  display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap;
+}
+.keybox input{
+  flex:1;min-width:220px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;
+  background:var(--card);color:var(--fg);
+  font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+.note{color:var(--warn)}
+@media (max-width:520px){ header{padding:12px} main{padding:12px} }
+</style>
+</head>
+<body
+  data-clip
+  data-suffix="{{.Suffix}}"
+  data-rev="{{.Rev}}"
+  data-state="{{.State}}"
+  data-base="{{.Base}}"
+  data-expires="{{.ExpiresText}}"
+  data-max-asset="{{.MaxAssetText}}"
+  data-can-write="{{.CanWrite}}">
+
+<header>
+  <a class="brand" href="/">Relay <span>网络剪贴板</span></a>
+  <span class="addr" id="addr">{{.Base}}/{{.Suffix}}</span>
+</header>
+
+<main>
+  <p class="hint" id="hint">{{.Hint}}</p>
+
+  <textarea id="body" spellcheck="false" autocapitalize="off" autocomplete="off"
+    aria-label="剪贴板内容"{{if not .Editable}} readonly{{end}}>{{.Body}}</textarea>
+
+  <div class="thumbs" id="thumbs">{{range .Assets}}<figure><a href="{{$.Base}}/{{$.Suffix}}/raw/{{.Position}}" target="_blank" rel="noopener"><img src="{{$.Base}}/{{$.Suffix}}/raw/{{.Position}}" alt="图片 {{.Position}}"></a></figure>{{end}}</div>
+
+  <div class="row" id="actions">
+    <button class="primary" id="save" hidden>保存</button>
+    <label class="file" id="addimg" hidden>加图片<input type="file" id="files" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden></label>
+    <button id="copy">复制全文</button>
+    <button id="del" hidden>删除</button>
+  </div>
+
+  <p class="status" id="status" role="status" aria-live="polite"></p>
+
+  <details class="meta">
+    <summary>详细</summary>
+    <dl>
+      <dt>版本</dt><dd id="rev">{{.Rev}}</dd>
+      <dt>过期</dt><dd id="exp">{{.ExpiresText}}</dd>
+      <dt>纯文本</dt><dd><a href="{{.Base}}/{{.Suffix}}/raw">{{.Base}}/{{.Suffix}}/raw</a></dd>
+      <dt>编辑钥匙</dt><dd id="keystate">{{.KeyState}}</dd>
+    </dl>
+    <div class="keybox">
+      <button id="genkey" type="button">显示编辑钥匙链接</button>
+      <input id="keyurl" type="text" readonly hidden aria-label="编辑钥匙链接">
+      <button id="copykey" type="button" hidden>复制</button>
+    </div>
+    <p class="meta note" id="keynote" hidden>这条链接里的人带着写权限，等于密码：发之前想一秒。<br>用 <code>curl</code> 读这份内容是 <code>curl {{.Base}}/{{.Suffix}}/raw</code></p>
+  </details>
+</main>
+
+<script nonce="{{.Nonce}}">
+"use strict";
+(function () {
+  var root = document.body;
+  var suffix = root.dataset.suffix;
+  var base = root.dataset.base;
+  var rev = parseInt(root.dataset.rev, 10) || 0;
+  var exists = root.dataset.state === "existing";
+  var canWrite = root.dataset.canWrite === "true";
+
+  var body = document.getElementById("body");
+  var hint = document.getElementById("hint");
+  var status = document.getElementById("status");
+  var saveBtn = document.getElementById("save");
+  var delBtn = document.getElementById("del");
+  var addImg = document.getElementById("addimg");
+  var files = document.getElementById("files");
+  var thumbs = document.getElementById("thumbs");
+  var revEl = document.getElementById("rev");
+  var expEl = document.getElementById("exp");
+  var keyState = document.getElementById("keystate");
+
+  var PREFIX = "relay.clip.";
+  // Declared before the handlers that stop it: `polling` is read by the poll
+  // loop, which only runs once the clip exists.
+  var polling = false;
+
+  function stored() { try { return localStorage.getItem(PREFIX + suffix) || ""; } catch (e) { return ""; } }
+  function store(t) { try { localStorage.setItem(PREFIX + suffix, t); } catch (e) {} }
+
+  // The edit key can arrive in the URL fragment. A fragment is never sent to the
+  // server (it stays out of access logs and Referer), which is why the key is
+  // carried there rather than in a query parameter — the same reasoning the
+  // one-step key hand-off in teleport uses. It is adopted and then removed from
+  // the address bar so a screenshot or a shared screen does not leak it.
+  (function adoptFragment() {
+    var h = location.hash;
+    if (h.indexOf("#k=") === 0 && h.length > 3) {
+      store(decodeURIComponent(h.slice(3)));
+      try { history.replaceState(null, "", location.pathname); } catch (e) {}
+    }
+  })();
+
+  var token = stored();
+  var writable = canWrite || !!token;
+
+  function say(msg, tone) {
+    status.textContent = msg || "";
+    if (tone) status.setAttribute("data-tone", tone); else status.removeAttribute("data-tone");
+  }
+
+  function paint() {
+    // Editing is enabled only when this browser can actually save: a textarea
+    // someone can type into but not save is worse than a read-only one.
+    body.readOnly = !writable;
+    saveBtn.hidden = !writable;
+    addImg.hidden = !writable;
+    delBtn.hidden = !writable || !exists;
+    keyState.textContent = token ? (exists ? "这台浏览器有写权限" : "创建时自动生成") : "无（只能读）";
+  }
+
+  function dirty() { return writable && body.value !== lastLoaded; }
+  var lastLoaded = body.value;
+
+  async function api(method, path, opts) {
+    opts = opts || {};
+    var res = await fetch(base + path, {
+      method: method,
+      headers: opts.headers || {},
+      body: opts.body,
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error"
+    });
+    var text = await res.text();
+    var json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (e) {}
+    return { status: res.status, ok: res.ok, json: json, text: text };
+  }
+
+  function applyClip(data) {
+    if (typeof data.rev === "number") { rev = data.rev; revEl.textContent = String(rev); }
+    if (typeof data.exists === "boolean") exists = data.exists;
+    if (typeof data.body === "string") {
+      body.value = data.body;
+      lastLoaded = data.body;
+    }
+    if (typeof data.expires_at === "number") expEl.textContent = data.expires_text || expEl.textContent;
+    if (Array.isArray(data.assets)) {
+      thumbs.textContent = "";
+      data.assets.forEach(function (a) {
+        var fig = document.createElement("figure");
+        var link = document.createElement("a");
+        link.href = base + "/" + suffix + "/raw/" + a.position;
+        link.target = "_blank";
+        link.rel = "noopener";
+        var img = document.createElement("img");
+        img.src = link.href;
+        img.alt = "图片 " + a.position;
+        link.appendChild(img);
+        fig.appendChild(link);
+        thumbs.appendChild(fig);
+      });
+    }
+  }
+
+  async function save() {
+    saveBtn.disabled = true;
+    say("保存中…");
+    var payload = JSON.stringify({ body: body.value });
+    var headers = { "Content-Type": "application/json" };
+    if (token) headers["X-Relay-Clip-Token"] = token;
+    try {
+      var r = await api("PUT", "/api/clips/" + encodeURIComponent(suffix), { headers: headers, body: payload });
+      // Field names come from the wire, not from Go: requests are camelCase
+      // (`expiresInHours`) and responses are snake_case (`owner_token`,
+      // `expires_at`). Getting this backwards is silent — the create succeeds,
+      // nothing is stored, and the browser quietly loses write access to the
+      // clip it just made.
+      if (r.status === 201 && r.json && r.json.data && r.json.data.owner_token) {
+        token = r.json.data.owner_token;
+        store(token);
+        writable = true;
+        exists = true;
+        say("已创建并保存（这台浏览器记住了写权限）", "ok");
+      } else if (r.status === 201) {
+        // Created but no credential came back. That is a contract bug, not a
+        // user error: fail loudly rather than pretending the save worked and
+        // leaving this browser unable to write to its own clip.
+        say("创建成功了，但没有拿到写权限（这是 bug，请刷新页面重试并反馈）。", "err");
+      } else if (r.ok) {
+        exists = true;
+        say("已保存", "ok");
+      } else if (r.status === 409) {
+        say("这个后缀已经被别人占了。换一个后缀，或者用编辑钥匙链接打开。", "err");
+      } else if (r.status === 429) {
+        say("写得太频繁了，歇一会儿再试。", "err");
+      } else {
+        var m = r.json && r.json.error ? r.json.error.message : "保存失败（HTTP " + r.status + "）";
+        say(m, "err");
+      }
+      if (r.json && r.json.data) applyClip(r.json.data);
+      paint();
+      if (exists) startPolling();
+    } catch (e) {
+      say("网络错误，没保存成功。", "err");
+    } finally {
+      saveBtn.disabled = false;
+    }
+  }
+
+  async function upload(list) {
+    if (!list || !list.length) return;
+    if (!token) { say("没有写权限，无法上传图片。", "err"); return; }
+    var fd = new FormData();
+    for (var i = 0; i < list.length; i++) fd.append("images", list[i]);
+    say("上传中…");
+    try {
+      var r = await api("POST", "/api/clips/" + encodeURIComponent(suffix) + "/assets", {
+        headers: { "X-Relay-Clip-Token": token },
+        body: fd
+      });
+      if (r.ok) { say("图片已上传", "ok"); if (r.json && r.json.data) applyClip(r.json.data); }
+      else if (r.status === 404) say("没有写权限，或这份剪贴板已经过期。", "err");
+      else if (r.status === 413) say("图片太大（单张上限 " + (root.dataset.maxAsset || "5 MiB") + "）。", "err");
+      else {
+        var m = r.json && r.json.error ? r.json.error.message : "上传失败（HTTP " + r.status + "）";
+        say(m, "err");
+      }
+    } catch (e) {
+      say("网络错误，图片没传上去。", "err");
+    }
+  }
+
+  saveBtn.addEventListener("click", save);
+  delBtn.addEventListener("click", async function () {
+    if (!confirm("删除这份剪贴板？内容立刻消失，无法恢复。")) return;
+    var r = await api("DELETE", "/api/clips/" + encodeURIComponent(suffix), {
+      headers: { "X-Relay-Clip-Token": token }
+    });
+    if (r.status === 204) {
+      // Stay on the address instead of navigating away: the suffix is free
+      // again, so "delete, then immediately write something else here" needs no
+      // round trip through the landing page.
+      polling = false;
+      try { localStorage.removeItem(PREFIX + suffix); } catch (e) {}
+      token = ""; writable = canWrite; exists = false;
+      body.value = ""; lastLoaded = ""; rev = 0; revEl.textContent = "0";
+      thumbs.textContent = "";
+      paint();
+      say("已删除。这个后缀现在是空的，可以直接重新写。", "ok");
+    } else {
+      say("删除失败（HTTP " + r.status + "）。", "err");
+    }
+  });
+  addImg.addEventListener("click", function () { files.click(); });
+  files.addEventListener("change", function () { upload(files.files); files.value = ""; });
+
+  // Paste an image straight into the page: this is the fastest path from
+  // "screenshot on machine A" to "visible on machine B", which is the whole
+  // point of the feature.
+  document.addEventListener("paste", function (ev) {
+    if (!writable) return;
+    var items = ev.clipboardData && ev.clipboardData.items;
+    if (!items) return;
+    var imgs = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].kind === "file" && items[i].type.indexOf("image/") === 0) {
+        var f = items[i].getAsFile();
+        if (f) imgs.push(f);
+      }
+    }
+    if (imgs.length) { ev.preventDefault(); upload(imgs); }
+  });
+
+  document.getElementById("copy").addEventListener("click", async function () {
+    try {
+      await navigator.clipboard.writeText(body.value);
+      say("已复制到剪贴板", "ok");
+    } catch (e) {
+      // Fallback for a page that is not a secure context or has no permission.
+      body.removeAttribute("readonly");
+      body.select();
+      say("请按 Ctrl/Cmd+C 复制（浏览器不给自动复制权限）", "err");
+    }
+  });
+
+  document.getElementById("genkey").addEventListener("click", function () {
+    var box = document.getElementById("keyurl");
+    var copy = document.getElementById("copykey");
+    var note = document.getElementById("keynote");
+    if (!token) { say("这台浏览器没有写权限，拿不到编辑钥匙。", "err"); return; }
+    box.value = base + "/" + suffix + "#k=" + encodeURIComponent(token);
+    box.hidden = false; copy.hidden = false; note.hidden = false;
+    box.select();
+  });
+  document.getElementById("copykey").addEventListener("click", async function () {
+    var box = document.getElementById("keyurl");
+    try { await navigator.clipboard.writeText(box.value); say("编辑钥匙链接已复制", "ok"); }
+    catch (e) { box.select(); say("请按 Ctrl/Cmd+C 复制", "err"); }
+  });
+
+  // Long-polling: hold one request open until the revision changes, then update.
+  // A dirty textarea is never clobbered — someone typing on this machine would
+  // otherwise lose their text to an update from the other one.
+  //
+  // Only started once the clip exists: an empty suffix nobody has written yet
+  // has nothing to watch, and holding a request open for it would be pure noise.
+  // Only started once the clip exists: an empty suffix nobody has written yet
+  // has nothing to watch, and holding a request open for it would be pure noise.
+  function startPolling() { if (!polling) { polling = true; poll(); } }
+  async function poll() {
+    while (polling) {
+      try {
+        var r = await api("GET", "/api/clips/" + encodeURIComponent(suffix) + "?rev=" + rev + "&wait=25");
+        if (r.ok && r.json && r.json.data) {
+          var d = r.json.data;
+          if (typeof d.rev === "number" && d.rev !== rev) {
+            if (dirty()) {
+              say("另一端已经更新（本地有未保存的改动，没有覆盖）", "err");
+            } else {
+              applyClip(d);
+              exists = !!d.exists;
+              paint();
+              say("已同步另一端的最新内容", "ok");
+            }
+            rev = d.rev;
+            revEl.textContent = String(rev);
+          } else if (typeof d.exists === "boolean") {
+            exists = d.exists;
+          }
+        }
+      } catch (e) { /* transient: retry after the delay below */ }
+      await new Promise(function (res) { setTimeout(res, polling ? 800 : 0); });
+    }
+  }
+
+  body.addEventListener("input", function () {
+    if (dirty()) say("有未保存的改动");
+  });
+
+  paint();
+  if (hint) hint.hidden = exists;
+  if (exists) startPolling();
+  window.addEventListener("beforeunload", function (ev) {
+    if (dirty()) { ev.preventDefault(); ev.returnValue = ""; }
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+# systemd unit for Relay's clip service (the network clipboard).
+#
+# It listens on loopback only. The public path in is frp: this host dials OUT to
+# frps on hcyj, which opens a port there, and Caddy on hcyj terminates TLS and
+# proxies to it. Nothing has to be reachable from the internet at this end, which
+# is what makes running the backend on a machine behind a home/office NAT work at
+# all.
+#
+# Install:
+#   cp clip.service /etc/systemd/system/clip.service
+#   install -d -o relay -g relay -m 0750 /data/services/clip
+#   install -m 0600 -o root -g root clip.env.example /data/services/clip/clip.env
+#   systemctl daemon-reload && systemctl enable --now clip
+[Unit]
+Description=Relay clip (network clipboard)
+Documentation=https://github.com/zeroicey/relay
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+WorkingDirectory=/data/services/clip
+
+# Secrets live in a root-only file; systemd reads it as root before dropping
+# privileges. NOTE: EnvironmentFile values are taken literally (no shell
+# expansion), which is what keeps a `$` inside a password safe. A shell `source`
+# of the same file would mangle it.
+EnvironmentFile=/data/services/clip/clip.env
+
+ExecStart=/data/services/clip/clip
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+# PrivateTmp matters for uploads: multipart parsing spills larger files to
+# temporary storage, and this keeps that storage private to the service.
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+# The service needs no privileges at all: one TCP socket on loopback and one
+# outbound connection to Postgres.
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

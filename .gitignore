@@ -1,0 +1,29 @@
+# Cross-compiled binaries. ~25 MB each and reproducible from source, so they
+# never belong in git.
+/bin/
+
+# A local .env (the service reads one next to the binary or in the working
+# directory, for development convenience only — production uses systemd's
+# EnvironmentFile).
+.env
+.env.*
+!.env.example
+*.env
+
+# Nothing here writes a data directory (all state lives in Postgres), but a
+# stray one from a local experiment should not be committable.
+/data/
+
+# Local verification artifacts: browser screenshots and throwaway Chrome
+# profiles from bin/e2e. Regenerable, and the profiles contain cookies.
+/bin/e2e/localtest/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
+
+# Tool session state (pi task output, session logs). Not project content.
+/.pi/
