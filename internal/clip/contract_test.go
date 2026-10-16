@@ -3,7 +3,9 @@ package clip
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -163,4 +165,125 @@ func TestUnknownAPIPathAnswersInTheEnvelope(t *testing.T) {
 			t.Errorf("GET %s has no error code", path)
 		}
 	}
+}
+
+// TestHeadMirrorsGetOnEveryRoute guards a defect the deploy check itself found.
+//
+// Gin matches methods exactly: a route registered with GET does NOT answer HEAD.
+// A HEAD request therefore matched no route and fell through to the NoRoute
+// dispatcher for public paths, which reads the first path segment as a clip
+// suffix. That made `curl -sI https://clip.hcyj.xyz/api/health` — the
+// "complete public path" step in .ai/runbooks/deploy-clip.md, and one of the
+// three checks a fresh session is told to run — answer 404, and answered
+// /robots.txt, /favicon.ico and /favicon.svg with 400 "invalid suffix".
+//
+// The assertion runs against a real net/http server instead of an
+// httptest.ResponseRecorder on purpose: RFC 9110 §9.3.2's "same headers as GET,
+// but no body" is implemented by net/http discarding the body for HEAD, and a
+// ResponseRecorder does not model that — it would record the body and hide the
+// very property under test.
+func TestHeadMirrorsGetOnEveryRoute(t *testing.T) {
+	r := testServer(t)
+
+	// A clip with content, so the page and the raw view are success paths rather
+	// than expiry/not-found paths.
+	w := do(t, r, "PUT", "/api/clips/ops1", map[string]any{"body": "hello"}, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("setup: create = %d (%s)", w.Code, w.Body.String())
+	}
+
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	for _, path := range []string{
+		"/", "/robots.txt", "/favicon.ico", "/favicon.svg",
+		"/ops1", "/ops1/raw", "/brandnew", "/api/health", "/api/nope",
+	} {
+		get := fetch(t, srv, "GET", path)
+		getBody := readBody(t, get)
+
+		head := fetch(t, srv, "HEAD", path)
+		headBody := readBody(t, head)
+
+		if head.StatusCode != get.StatusCode {
+			t.Errorf("HEAD %s = %d, GET = %d (Gin does not route HEAD to a GET route)",
+				path, head.StatusCode, get.StatusCode)
+		}
+		if got, want := head.Header.Get("Content-Type"), get.Header.Get("Content-Type"); got != want {
+			t.Errorf("HEAD %s content-type = %q, GET = %q", path, got, want)
+		}
+		if len(headBody) != 0 {
+			t.Errorf("HEAD %s returned a %d-byte body; HEAD must carry no body", path, len(headBody))
+		}
+		// Anti-vacuity: on every path but the icon, GET must actually send a body,
+		// otherwise "HEAD has no body" would hold for the wrong reason.
+		if path != "/favicon.ico" && len(getBody) == 0 {
+			t.Errorf("GET %s sent no body, so the HEAD body assertion proves nothing", path)
+		}
+		// net/http decides Content-Length itself (a body that fits its buffer is
+		// measured, a larger one is streamed), so the contract is not a fixed
+		// number: HEAD must advertise exactly the header GET advertised, and never
+		// a stale or truncated one.
+		// The raw header is compared, not resp.ContentLength: for a 204 the client
+		// reports 0 for GET and -1 for HEAD although the server sent neither a
+		// Content-Length nor a body in both cases — a client-side detail, not a
+		// difference in what this service emits.
+		if hcl, gcl := head.Header.Get("Content-Length"), get.Header.Get("Content-Length"); hcl != gcl {
+			t.Errorf("HEAD %s Content-Length header = %q, GET = %q", path, hcl, gcl)
+		}
+	}
+}
+
+// TestPublicPathsOnlyAnswerReadMethods pins the other half of the same root
+// cause: NoRoute runs for every method, so a write-shaped request to a page path
+// used to be answered with the page and a 200 — a client that POSTs and gets a
+// document has no way to tell it did nothing. Writes live under /api, where the
+// owner token is checked in SQL, so the page namespace names the methods it has.
+func TestPublicPathsOnlyAnswerReadMethods(t *testing.T) {
+	r := testServer(t)
+	for _, tc := range []struct{ method, path string }{
+		{"POST", "/"}, {"POST", "/ops1"}, {"PUT", "/ops1"},
+		{"DELETE", "/ops1"}, {"PATCH", "/brandnew"}, {"OPTIONS", "/ops1"},
+	} {
+		w := do(t, r, tc.method, tc.path, nil, nil)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s = %d, want 405", tc.method, tc.path, w.Code)
+		}
+		if allow := w.Header().Get("Allow"); allow != "GET, HEAD" {
+			t.Errorf("%s %s Allow = %q, want \"GET, HEAD\"", tc.method, tc.path, allow)
+		}
+	}
+
+	// The /api namespace keeps its own rule: an unmatched path is a 404 in the
+	// envelope whatever the method, because no route exists for it at all.
+	w := do(t, r, "POST", "/api/nope", nil, nil)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("POST /api/nope = %d, want 404 (the envelope rule is method-agnostic)", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("POST /api/nope answered %q, want JSON", ct)
+	}
+}
+
+func fetch(t *testing.T, srv *httptest.Server, method, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, srv.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return resp
+}
+
+func readBody(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", resp.Request.URL.Path, err)
+	}
+	return body
 }

@@ -43,3 +43,7 @@ renderPage(c.Writer, ...)
 
 相关：`.ai/pitfalls/cases/2026-10-12-csp-blocks-the-assets-the-page-links.md` 也是同一类
 「页面看起来对、但语义是错的」故障。
+
+同一片区域的第二个坑：`.ai/pitfalls/cases/2026-10-16-head-is-not-get-in-gin-routing.md`
+—— 同一个 NoRoute 分发器还会**不区分方法**地接住请求（Gin 不会把 HEAD 路由到 GET 上，
+`POST /<后缀>` 也曾拿到 200 页面）。

@@ -595,3 +595,40 @@ func extractNonce(t *testing.T, csp string) string {
 	}
 	return rest[:j]
 }
+
+// TestEveryGetRouteAlsoAnswersHead is the cheap, database-free half of the HEAD
+// guard, and the half that runs in the default gate (scripts/check.sh skips every
+// test that needs TEST_PG_DSN, and the end-to-end version of this check is one of
+// them).
+//
+// It reads the router's own route table instead of issuing requests, so it needs
+// no store: NewServer does not dereference one while building the router. Gin
+// matches methods exactly, so a GET route without a HEAD twin is invisible to
+// HEAD and the request falls through to NoRoute — which is how
+// `curl -sI https://clip.hcyj.xyz/api/health` came to answer 404. The dynamic
+// public paths (`/<suffix>`) have no route entry at all and are covered by
+// TestHeadMirrorsGetOnEveryRoute instead.
+func TestEveryGetRouteAlsoAnswersHead(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &Config{PublicBaseURL: "http://test.local", Environment: "test", WritePerHour: 30}
+	_, router := NewServer(cfg, nil, "test", slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	head := map[string]bool{}
+	var gets []string
+	for _, route := range router.Routes() {
+		if route.Method == http.MethodHead {
+			head[route.Path] = true
+		}
+		if route.Method == http.MethodGet {
+			gets = append(gets, route.Path)
+		}
+	}
+	if len(gets) == 0 {
+		t.Fatal("the router registered no GET routes; this guard would pass vacuously")
+	}
+	for _, path := range gets {
+		if !head[path] {
+			t.Errorf("GET %s has no HEAD twin, so a HEAD probe falls into NoRoute", path)
+		}
+	}
+}

@@ -75,30 +75,48 @@ func (s *Server) router() *gin.Engine {
 	r.Use(s.requestContext())
 	r.Use(s.accessLog())
 
-	r.GET("/", func(c *gin.Context) { renderLanding(c.Writer) })
-	r.GET("/robots.txt", func(c *gin.Context) {
+	// HEAD is registered next to every GET, because Gin matches methods exactly:
+	// a route added with GET does NOT answer HEAD, so a HEAD request matched no
+	// route at all and fell through to the NoRoute dispatcher for public paths,
+	// which reads the first segment as a clip suffix. That turned the deploy check
+	// `curl -sI https://clip.hcyj.xyz/api/health` into a 404 and answered
+	// /robots.txt, /favicon.ico and /favicon.svg with 400 "invalid suffix" —
+	// while `curl -I` is exactly how monitors, CDNs, load balancers and
+	// `wget --spider` probe a service, so it reported itself broken to the clients
+	// watching it. RFC 9110 §9.3.2 requires HEAD to return the same status and
+	// header fields as GET, so no handler below needs a special case: net/http
+	// discards the body for HEAD and frames the response exactly as it frames the
+	// GET — a measured Content-Length when the body fits its buffer, a streamed
+	// response when it does not.
+	get := func(relativePath string, handlers ...gin.HandlerFunc) {
+		r.GET(relativePath, handlers...)
+		r.HEAD(relativePath, handlers...)
+	}
+
+	get("/", func(c *gin.Context) { renderLanding(c.Writer) })
+	get("/robots.txt", func(c *gin.Context) {
 		c.Header("Content-Type", "text/plain; charset=utf-8")
 		c.String(http.StatusOK, robotsTXT)
 	})
-	r.GET("/favicon.svg", func(c *gin.Context) {
+	get("/favicon.svg", func(c *gin.Context) {
 		c.Header("Content-Type", "image/svg+xml")
 		c.Header("Cache-Control", "public, max-age=86400")
 		c.String(http.StatusOK, faviconSVG)
 	})
-	r.GET("/api/health", s.handleHealth)
+	get("/api/health", s.handleHealth)
 	// Browsers request /favicon.ico implicitly on every page. Without this route
 	// it falls through to the clip-suffix handler, where a name containing a dot
 	// is an invalid suffix — so the browser would get a 400 and log a console
 	// error on every visit. A 204 is the accepted "there is no icon" answer and
 	// keeps the console clean (the real icon is linked as favicon.svg).
-	r.GET("/favicon.ico", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	get("/favicon.ico", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 
 	// Registered explicitly rather than as a wildcard so Gin's radix tree never
 	// has to choose between a static and a parameterised first segment. The
 	// public surface (`/<suffix>`, `/<suffix>/raw[/n]`) is dispatched from
 	// NoRoute below for the same reason — a `/:suffix` route plus static routes
 	// like `/api/...` is exactly the shape that panics or misroutes.
-	r.GET("/api/clips/:suffix", s.handleGetClip)
+	get("/api/clips/:suffix", s.handleGetClip)
 	r.PUT("/api/clips/:suffix", s.handlePutClip)
 	r.DELETE("/api/clips/:suffix", s.handleDeleteClip)
 	r.POST("/api/clips/:suffix/assets", s.handlePutAssets)
@@ -578,15 +596,6 @@ func (s *Server) handlePutAssets(c *gin.Context) {
 // explicit and in one readable place — including which shapes are *not* a clip.
 func (s *Server) handlePublicPath(c *gin.Context) {
 	path := strings.Trim(c.Request.URL.Path, "/")
-	if path == "" {
-		// Gin sets 404 on the response BEFORE running a NoRoute handler, so any
-		// handler here that produces real content has to put the status back.
-		// Forgetting it renders a correct page that reports 404 — a page that
-		// looks fine in a browser and lies to every script and monitor.
-		c.Status(http.StatusOK)
-		renderLanding(c.Writer)
-		return
-	}
 	parts := strings.Split(path, "/")
 
 	// Anything unmatched under /api is answered in the JSON envelope, never as
@@ -595,8 +604,35 @@ func (s *Server) handlePublicPath(c *gin.Context) {
 	// and the text/plain 404 the page routes use would look like a proxy error.
 	// (Found on the live deployment, where the envelope's absence was the only
 	// contract break in an otherwise green run.)
+	//
+	// This branch is deliberately method-agnostic and comes first: no route exists
+	// for an unknown /api path under ANY method, so the honest answer is 404 in the
+	// envelope shaped like every other API answer.
 	if parts[0] == "api" {
 		fail(c, http.StatusNotFound, "not_found", "未知的接口路径。")
+		return
+	}
+
+	// The public namespace is a read view, and NoRoute runs for every method — so
+	// without this a POST (or PUT, or DELETE) to /ops1 rendered the page with 200,
+	// answering a write-shaped request with a document. Only GET and HEAD read a
+	// clip; writes live under /api/clips/<suffix>, where the owner token is
+	// checked. 405 with Allow says which methods do work.
+	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+		c.Header("Allow", "GET, HEAD")
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		c.Header("Cache-Control", "no-store")
+		c.String(http.StatusMethodNotAllowed, "method not allowed\n")
+		return
+	}
+
+	if path == "" {
+		// Gin sets 404 on the response BEFORE running a NoRoute handler, so any
+		// handler here that produces real content has to put the status back.
+		// Forgetting it renders a correct page that reports 404 — a page that
+		// looks fine in a browser and lies to every script and monitor.
+		c.Status(http.StatusOK)
+		renderLanding(c.Writer)
 		return
 	}
 

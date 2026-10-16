@@ -1,21 +1,44 @@
 # Current task
 
-**Status:** ✅ **完成态** —— clip 已完整上线并验证；老 teleport 服务已按指示停掉；
-teleport 的重写在另一个仓库里（P0/P1 已完成，P2 未开工）。
-**Updated:** 2026-10-16 · **交接文档：** `.ai/sessions/2026-10-16-clip-split-and-launch-handoff.md`
-
-**下一步：只剩两件人类动作，没有代码工作。**
-
-1. **GitHub 改名** `zeroicey/teleport` → `zeroicey/clip`，然后
-   `git remote set-url origin git@github.com:zeroicey/clip.git`。
-   （`gh` 已认证可用；`zeroicey/clip` 名字可用；仓库 public、0 issue/star，改名零损失且保留全部历史。）
-2. **本地目录改名** `/data/dev/teleport` → `/data/dev/clip` —— 必须在**会话结束之后**做（会话绑定 cwd）。
+**Status:** 🟡 **待人类裁决一次部署** —— 线上仍是 `57dd925-dirty`（拆分前的脏构建）；
+本仓库里已修好一个路由缺陷（HEAD 掉进 NoRoute），闸门 + 真库测试 + 真进程验证全绿，
+但**未提交、未部署**（两件事都要先问人类）。
+**Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-clip-split-and-launch-handoff.md`
 
 teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.md` 开始读。
 
 ---
 
-## 本轮做了什么
+## 本轮（照交接文档跑那三条连通性检查）
+
+交接文档给新会话的职责只有一条：证明 hpcore → hcyj 通（三条命令，都要 200 / `verify=0`）。
+
+| 检查 | 结果 |
+| --- | --- |
+| b) 证书 `curl -w '%{ssl_verify_result} %{http_code}'` | ✅ `verify=0 http=200` |
+| c) 隧道那一跳（从 hcyj curl `172.17.0.1:8790`） | ✅ `200` |
+| a) `curl -sI https://clip.hcyj.xyz/api/health` | ❌ **404**（同一路径 GET 是 200） |
+
+**根因不是网络**。Gin 的方法匹配是精确的：HEAD 不匹配用 GET 注册的路由，于是掉进
+`NoRoute` 的公共路径分发器，第一个路径段被当成后缀。同一根因下 `/robots.txt`、
+`/favicon.ico`、`/favicon.svg` 的 HEAD 返回 **400**（后缀不合法），而 `POST /<后缀>`
+返回 **200 + 一页 HTML**。也就是：**监控/CDN/`curl -I` 这类客户端看到的是「坏了」**。
+细节与守卫：`.ai/pitfalls/cases/2026-10-16-head-is-not-get-in-gin-routing.md`。
+
+**已修（工作区，未提交）**：`internal/clip/api.go` —— 每条 GET 路由同时登记 HEAD；
+公共命名空间只服务 GET/HEAD，其余 405 + `Allow: GET, HEAD`；`/api` 分支保持方法无关。
+
+**验证（都是实跑，不是推断）**：
+
+- `scripts/check.sh` 全绿；`scripts/test-pg.sh`（真库 `relay_test`）全绿。
+- 两个新守卫都验过**反向**：stash 掉 `api.go` 后它们按线上现象失败。
+- 真进程：`/tmp/clip-fixed` 起在 `127.0.0.1:8791`（对 `relay_test`），与线上跑同一张
+  方法/状态码矩阵 —— **只有 7 个单元格变化（4 个 HEAD + 3 个 405），其余全同**，
+  即修复没有附带行为变化，也反过来证明线上那版与 HEAD 在行为上是一致的。
+
+---
+
+## 上一轮做了什么（拆分与上线）
 
 用户原话（三轮）：
 
@@ -82,6 +105,17 @@ teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.
 6. `bjbuwe`（121.9.113.26）观测点 ssh 不可达，大陆观测点只剩 hcyj 与 koma。
 7. `scripts/verify-clip-browser.cjs` 里写死了 `chromium-1248` 的路径（沿用既有脚本的做法）。
 8. clip 的 **QR/二维码**、纯文本一键分享、以及「后缀被占」时的一键换名，都没做。
+9. **HEAD/405 修复待部署**（本轮已修、已验证，见上）。部署需要人类同意；
+   部署后 `curl -sI https://clip.hcyj.xyz/api/health` 才会从 404 变 200。
+10. **线上二进制无法追溯**：`version` 是 `57dd925-dirty`，本仓库历史里没有这个提交
+    （拆分重写过历史 + 脏工作区构建）。嵌入页面与依赖和仓库一致、行为只差本轮修的两处，
+    但它**无法从任何提交复现**。规则已写进 runbook：只从干净树构建 + 部署后核对 `version`。
+11. **两条旧「下一步」已经完成**（记录里曾是待办）：`origin` 已是 `github.com/zeroicey/clip`
+    且已推送；工作目录已是 `/data/dev/clip`。
+12. 公共命名空间对**非 GET/HEAD** 一律 405，但 `/api/clips/:suffix` 上的错方法
+    （如 `POST`）仍是 `404 + 封套`：要变成 405 + `Allow` 需要打开 Gin 的
+    `HandleMethodNotAllowed` 并自己算 `Allow`。现在这套是**刻意**的（`/api` 的未知路径
+    规则是方法无关的 404 + 封套），但如果以后要严格，就要在那儿一次做完。
 
 ### 老 teleport 服务：已停并禁用（2026-10-16，用户确认无人使用）
 
