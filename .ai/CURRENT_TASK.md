@@ -261,7 +261,8 @@ teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.
 
 1. ~~DNS 泛解析~~ ✅ **已修**（原记录是 `81.148.233.134` ＝ **英国电信 BT 的地址**；现已指向 hcyj）。
    证书已签发，`docker restart caddy` 后约 40 秒生效。
-2. **GitHub 改名 + 本地目录改名**（见上方「下一步」）。
+2. ~~GitHub 改名 + 本地目录改名~~ ✅ **已完成**（已核实）：`origin` = `github.com/zeroicey/clip`、
+   仓库名已是 `clip`、本地目录 `/data/dev/clip`。
 3. **Postgres 备份未排期** —— 现已承载两个服务的数据（`relay` 库 + teleport 的 `teleport` 库），
    只有部署前的手工 `pg_dump`，而且 **`pg_restore` 从未演练过**。这是最大的运维缺口。
 4. **Postgres 凭据只在本机**：`/data/services/clip/clip.env`（600 root:root），不在任何备份里。
@@ -275,6 +276,7 @@ teleport 的重写在 `/data/dev/teleport-gin`，从那里的 `.ai/CURRENT_TASK.
     的提交。旧的那版（`57dd925-dirty`）留在 `/data/backups/clip-binary-57dd925-dirty`。
     规则已写进 runbook：只从干净树构建 + 部署后核对 `version`（用「`version` 之后没有代码改动」
     而不是「等于 HEAD」，因为部署后的纯文档提交本来就会让两者不等）。
+    （后来又部署过两次，**当前线上版本见本文件顶部**。）
 11. **两条旧「下一步」已经完成**（记录里曾是待办）：`origin` 已是 `github.com/zeroicey/clip`
     且已推送；工作目录已是 `/data/dev/clip`。
 12. 公共命名空间对**非 GET/HEAD** 一律 405，但 `/api/clips/:suffix` 上的错方法
