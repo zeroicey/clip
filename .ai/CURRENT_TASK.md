@@ -2,8 +2,9 @@
 
 **Status:** ✅ **已上线并验证** —— 定位 = **webnote.cc 的开源版本**。
 步骤 ①（密码 + MIT LICENSE + 自动保存）已实现、已部署（线上 `9126d5c`）。
-步骤 ②（分享链接 `/s/<token>`）未开工。
-**Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-password-and-ownership-handoff.md`
+**下一步 = 步骤 ②（只读分享链接 `/s/<token>`）：本会话在这里结束，从
+`.ai/sessions/2026-10-16-share-links-handoff.md` 接着做。**
+**Updated:** 2026-10-16（第二会话）· **交接文档：** `.ai/sessions/2026-10-16-share-links-handoff.md`
 
 ### 部署后的线上验证（都是实跑）
 
