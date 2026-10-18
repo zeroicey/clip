@@ -64,7 +64,17 @@ func testStore(t *testing.T, mutate ...func(*Config)) *Store {
 		// (ratelimit treats <= 0 as "unlimited"), so a test config that left it out
 		// would silently stop exercising password throttling.
 		UnlockPerHour: 20,
-		WritesEnabled: true,
+		// The request-level defence layer. These mirror config.Load so a test
+		// exercises the same shape production runs; the tests that deliberately
+		// hammer a budget turn bans off explicitly rather than relying on a
+		// conveniently disabled default.
+		RequestPerMinute: 240,
+		BanAfter:         5,
+		BanWindow:        10 * time.Minute,
+		BanFor:           15 * time.Minute,
+		BanMaxFor:        24 * time.Hour,
+		MaxPollsPerIP:    8,
+		WritesEnabled:    true,
 	}
 	for _, m := range mutate {
 		m(cfg)

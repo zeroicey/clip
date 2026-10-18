@@ -108,6 +108,28 @@ func ClientIP(r *http.Request) string {
 // client-chosen; a switch that can only ever be flipped wrongly is better
 // deleted than documented. Removing the option is the guard.
 
+// IsTrusted reports whether an address is one whose forwarded headers are
+// believed — the loopback and private ranges listed in trustedProxyPrefixes.
+//
+// It exists for the decisions that can lock a caller out for a long time. A ban
+// keyed on a trusted address is never correct in this deployment: the immediate
+// peer of the service is the local tunnel client (127.0.0.1), so a request whose
+// forwarding header did not arrive keys as loopback, and banning that address
+// would refuse every client on the internet at once. The same reasoning applies
+// to any shared proxy: if the only address we can name is one many people share,
+// we do not get to punish it.
+//
+// An unparseable value is reported as trusted, i.e. never bannable. That is the
+// fail-closed direction for the thing that must not happen (a ban), and it
+// matches ClientIP, which also collapses every unparseable case into one bucket.
+func IsTrusted(ip string) bool {
+	addr, ok := parseIP(ip)
+	if !ok {
+		return true
+	}
+	return isTrustedProxy(addr)
+}
+
 // forwardedFor flattens every X-Forwarded-For header, in received order.
 func forwardedFor(r *http.Request) []string {
 	values := r.Header.Values("X-Forwarded-For")

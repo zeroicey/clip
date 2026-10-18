@@ -197,3 +197,32 @@ func TestCloudflareHeaderIsAlwaysIgnored(t *testing.T) {
 		t.Errorf("ClientIP() = %q, want 127.0.0.1", got)
 	}
 }
+
+// TestIsTrustedIsTheBanGuard pins the addresses that must never be banned.
+//
+// The service's immediate peer is the local tunnel client, so a request whose
+// forwarding header did not arrive keys as loopback. Banning it would refuse the
+// entire internet at once — this is the single most dangerous thing a ban list
+// can do here, which is why the property is asserted rather than assumed.
+func TestIsTrustedIsTheBanGuard(t *testing.T) {
+	trusted := []string{
+		"127.0.0.1", "::1", "10.1.2.3", "172.17.0.1", "192.168.1.1", "fc00::1",
+		// Unparseable values fail closed (treated as trusted = never bannable).
+		"", "not-an-ip", "1.2.3.4/24", "unknown",
+	}
+	for _, ip := range trusted {
+		if !IsTrusted(ip) {
+			t.Errorf("IsTrusted(%q) = false; a ban could target a shared or unattributable address", ip)
+		}
+	}
+	untrusted := []string{
+		"203.0.113.9", "198.51.100.7", "8.8.8.8", "2001:db8::1",
+		// A port-bearing form is still a real client address, not a proxy.
+		"203.0.113.9:40000",
+	}
+	for _, ip := range untrusted {
+		if IsTrusted(ip) {
+			t.Errorf("IsTrusted(%q) = true; a real client would be exempt from banning", ip)
+		}
+	}
+}

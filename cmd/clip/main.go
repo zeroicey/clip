@@ -100,6 +100,10 @@ func main() {
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      90 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		// 64 KiB instead of the 1 MiB default. Nothing this service accepts needs
+		// a large header, and the default is a per-connection allocation a
+		// header-flood gets for free.
+		MaxHeaderBytes: 64 << 10,
 	}
 
 	// Janitor: expired clips are already invisible to every read, so this is

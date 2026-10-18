@@ -42,9 +42,21 @@ type Server struct {
 	// is deliberately expensive (argon2), so an unthrottled guesser is also a CPU
 	// and memory amplifier.
 	unlockLimiter *ratelimit.Limiter
-	log           *slog.Logger
-	version       string
-	started       time.Time
+	// requestLimiter is the coarse per-source budget for EVERY request, reads
+	// included. It is what stands between an anonymous public read path and a
+	// scraper driving the database at will.
+	requestLimiter *ratelimit.Limiter
+	// bans escalates repeated refusals (429s from any of the budgets above) into
+	// a temporary block of the source address. See guard and chargeStrike.
+	bans *ratelimit.Bans
+	// polls caps how many long polls one source may have parked at once. The hub
+	// already caps the total, but without a per-source cap one address can take
+	// every slot and leave nobody else's poll actually waiting.
+	polls *ratelimit.Concurrency
+	log   *slog.Logger
+	// version is the build stamp reported by /api/health.
+	version string
+	started time.Time
 }
 
 // NewServer builds the handler for the whole clip service.
@@ -60,9 +72,21 @@ func NewServer(cfg *Config, st *Store, version string, log *slog.Logger) (*Serve
 		// the failure mode recorded in
 		// .ai/pitfalls/cases/2026-10-10-rate-limit-collapsed-to-one-bucket.md.
 		unlockLimiter: ratelimit.New(cfg.UnlockPerHour, time.Hour),
-		log:           log,
-		version:       version,
-		started:       time.Now(),
+		// One minute, not an hour: this is the anti-flood layer, and the long poll
+		// reconnects every ~25s per open tab, so the budget has to be generous
+		// enough for a person with several tabs and tight enough to matter for a
+		// scraper.
+		requestLimiter: ratelimit.New(cfg.RequestPerMinute, time.Minute),
+		bans: ratelimit.NewBans(ratelimit.BanPolicy{
+			After:  cfg.BanAfter,
+			Window: cfg.BanWindow,
+			Base:   cfg.BanFor,
+			Max:    cfg.BanMaxFor,
+		}),
+		polls:   ratelimit.NewConcurrency(cfg.MaxPollsPerIP),
+		log:     log,
+		version: version,
+		started: time.Now(),
 	}
 	return s, s.router()
 }
@@ -85,7 +109,14 @@ func (s *Server) router() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(s.requestContext())
+	// Order matters. Headers first, so a refusal produced by the guard below still
+	// carries them; then the log, so refused requests are logged like any other;
+	// then the guard and the body ceiling, which are the only layers allowed to
+	// stop a request before a handler sees it.
+	r.Use(s.securityHeaders())
 	r.Use(s.accessLog())
+	r.Use(s.guard())
+	r.Use(s.bodyLimit())
 
 	// HEAD is registered next to every GET, because Gin matches methods exactly:
 	// a route added with GET does NOT answer HEAD, so a HEAD request matched no
@@ -175,12 +206,14 @@ func (s *Server) requestContext() gin.HandlerFunc {
 	}
 }
 
-// accessLog records method, path, status, size and duration — and nothing else.
+// accessLog records method, path, status, size and duration — and the resolved
+// client address, and nothing else.
 //
-// Deliberately no headers, no query string, no body: the write credential
-// travels in X-Relay-Clip-Token, and a log that recorded every header would put
-// every clip's owner token on disk. The reverse proxy in front of this service
-// has the same constraint, which is why it is written down in the runbook too.
+// Deliberately no headers, no query string, no body: the password travels in
+// X-Clip-Password, and a log that recorded every header would put every clip's
+// password on disk. The address is logged because it is what the ban list keys
+// on; it is not a credential. The reverse proxy in front of this service has the
+// same constraint, which is why it is written down in the runbook too.
 func (s *Server) accessLog() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -188,6 +221,10 @@ func (s *Server) accessLog() gin.HandlerFunc {
 		s.log.Info("request",
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
+			// The resolved client address, via clientip — never a raw header. It is
+			// needed to operate the ban list: without it a ban event names an address
+			// that nothing else in the log can be tied back to.
+			"ip", clientip.ClientIP(c.Request),
 			"status", c.Writer.Status(),
 			"bytes", c.Writer.Size(),
 			"ms", time.Since(start).Milliseconds(),
@@ -468,28 +505,36 @@ func (s *Server) handleGetClip(c *gin.Context) {
 		if window > longPollWindow {
 			window = longPollWindow
 		}
-		if ch, release, okWait := s.hub.subscribe(suffix); okWait {
-			timer := time.NewTimer(window)
-			select {
-			case <-ch:
-			case <-timer.C:
-			case <-c.Request.Context().Done():
-			}
-			timer.Stop()
-			// Release on every exit path: a leaked waiter means the next publish
-			// closes a channel nobody is reading and the hub grows forever.
-			release()
-			clip, err = s.store.Get(c.Request.Context(), suffix)
-			if err != nil && !errors.Is(err, ErrNotFound) {
-				s.log.Error("re-read clip after wait", "suffix", suffix, "error", err)
-				fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
-				return
-			}
-			// Re-checked rather than trusted from before the wait: the password can
-			// be changed (or set) while this request is parked, and the reader would
-			// otherwise be handed the new content on the strength of an old check.
-			if _, allowed := s.clipAccess(c, clip, passwordFrom(c)); !allowed {
-				return
+		// Per-source cap on parked polls. Past it the answer is immediate rather
+		// than an error: a poll that cannot park is still a correct poll, and a 429
+		// here would feed the ban list — punishing a person for having too many
+		// tabs open. The hub's global cap handles the total; this handles the
+		// distribution.
+		if ip := clientip.ClientIP(c.Request); s.polls.Acquire(ip) {
+			defer s.polls.Release(ip)
+			if ch, release, okWait := s.hub.subscribe(suffix); okWait {
+				timer := time.NewTimer(window)
+				select {
+				case <-ch:
+				case <-timer.C:
+				case <-c.Request.Context().Done():
+				}
+				timer.Stop()
+				// Release on every exit path: a leaked waiter means the next publish
+				// closes a channel nobody is reading and the hub grows forever.
+				release()
+				clip, err = s.store.Get(c.Request.Context(), suffix)
+				if err != nil && !errors.Is(err, ErrNotFound) {
+					s.log.Error("re-read clip after wait", "suffix", suffix, "error", err)
+					fail(c, http.StatusInternalServerError, "internal_error", "could not read the clip")
+					return
+				}
+				// Re-checked rather than trusted from before the wait: the password can
+				// be changed (or set) while this request is parked, and the reader would
+				// otherwise be handed the new content on the strength of an old check.
+				if _, allowed := s.clipAccess(c, clip, passwordFrom(c)); !allowed {
+					return
+				}
 			}
 		}
 	}

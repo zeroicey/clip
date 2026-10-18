@@ -40,11 +40,12 @@ clip 是一个**网络剪贴板**：`https://clip.hcyj.xyz/<后缀>` 打开一�
 | `internal/clip/store.go` | 连接池、迁移、全部存储语义（密码校验的证明、过期、配额、资产、接管清分享） |
 | `internal/clip/queries/*.sql` + `clipdb/` | sqlc 输入与生成物（`clips.sql` + `shares.sql`） |
 | `internal/clip/api.go` | Gin 路由、封套、JSON/multipart 写入、公共路径分发（含 `/s/...` 转发） |
+| `internal/clip/middleware.go` | 请求级安全层：全局安全响应头、每 IP 请求预算、违规→临时封禁、请求体上限（读路径与错误路径由此获得保护） |
 | `internal/clip/api_shares.go` | 分享的主入口（`/api/clips/:suffix/shares`）与访客读侧（`/s/...`、`/api/shares/:token`） |
 | `internal/clip/page.go` + `page.html` | 服务端渲染页面、CSP/nonce、落地页、robots/favicon |
 | `internal/clip/hub.go` | 进程内 long-poll hub（按后缀的唤醒） |
-| `internal/ratelimit/` | 固定窗口限流：按 IP 的写限流 + 按（地址/后缀/分享 token）的**口令失败**限流 |
-| `internal/clientip/` | 客户端 IP 判定（限流键）—— 从 teleport 抽出，规则与回归测试一并带过来 |
+| `internal/ratelimit/` | 固定窗口限流：按 IP 的写限流 + 按（地址/后缀/分享 token）的**口令失败**限流；外加 `Bans`（违规升级为临时封禁）与 `Concurrency`（按键的并发上限，用于长轮询） |
+| `internal/clientip/` | 客户端 IP 判定（限流键）—— 从 teleport 抽出，规则与回归测试一并带过来；`IsTrusted` 是封禁层的安全阀 |
 | `scripts/` | `check.sh`（闸门）、`build.sh`、`check-sqlc-sync.sh`、`test-pg.sh` |
 | `bin/e2e/` | 真实浏览器验证脚本（不进 git） |
 
@@ -135,6 +136,17 @@ clip 是一个**网络剪贴板**：`https://clip.hcyj.xyz/<后缀>` 打开一�
 11. **限流键来自 `clientip.ClientIP`**，绝不采信直接的转发头。
     **Guarded**：`internal/clientip` 的 4 个回归测试（含 Caddy `{remote}` 的 `host:port` 格式）、
     `TestUnlockBudgetIsPerSuffixAndPerClient`（伪造 `X-Forwarded-For` 不能造出新桶）。
+11a. **可信对端（loopback / 私网 / 隧道入口）永不封禁** —— 直接对端是本地 frpc，
+    没有转发头的请求会归到 `127.0.0.1`，封它等于封全网。
+    **Guarded**：`TestIsTrustedIsTheBanGuard`、`TestATrustedPeerIsNeverBanned`
+    （反向验证过：`IsTrusted` 恒为 false 时立刻红）。
+11b. **只有 429 计违规**，401 绝不计费（未解锁打开上锁 clip 是正常加载）。
+    **Guarded**：`TestAuthFailuresAloneDoNotBan`。
+11c. **中间件的拒绝形状按命名空间区分**：`/api/*` 走封套，其余 `text/plain`。
+    **Guarded**：`TestRepeatedRefusalsBanTheSource`、`TestRequestBudgetCoversReads`。
+11d. **安全响应头是中间件级的**（含错误路径），HTML 页面再用 nonce CSP 覆盖；
+    HSTS 仅在公网源是 HTTPS 时下发。**Guarded**：`TestSecurityHeadersAreOnEveryResponseShape`、
+    `TestHSTSOnlyWhenThePublicOriginIsHTTPS`。
 12. **schema 不漂移**：迁移目录是唯一真源，sqlc 读同一批文件，`sqlc diff` 在闸门里。
 
 ## 6. 边界与已知代价

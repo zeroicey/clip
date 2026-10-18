@@ -579,7 +579,11 @@ func TestGuessingIsThrottledButHonestReadsAreNot(t *testing.T) {
 // used for that: clientip.ClientIP ignores it for an untrusted peer, so forging
 // it cannot mint a bucket (asserted at the end).
 func TestUnlockBudgetIsPerSuffixAndPerClient(t *testing.T) {
-	r := testServer(t, func(c *Config) { c.UnlockPerHour = 2 })
+	// Bans are off in this test on purpose: it deliberately exhausts a budget from
+	// one address many times over, which is the input the ban layer escalates.
+	// Keeping the two concerns separate is what makes each assertion say what it
+	// means — this test is about the bucket split, not about bans.
+	r := testServer(t, func(c *Config) { c.UnlockPerHour = 2; c.BanAfter = 0 })
 	for _, s := range []string{"ops1", "ops2"} {
 		if w := do(t, r, "PUT", "/api/clips/"+s,
 			map[string]any{"body": "notes", "password": "s3cret"}, nil); w.Code != http.StatusCreated {

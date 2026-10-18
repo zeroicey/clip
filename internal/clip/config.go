@@ -50,6 +50,24 @@ type Config struct {
 
 	// WritePerHour is the per-source-IP write budget.
 	WritePerHour int
+	// RequestPerMinute is the per-source-IP budget for EVERY request, reads
+	// included. It is the anti-flood layer: the write budget is much tighter but
+	// covers only writes, and before this existed a single address could drive the
+	// read paths (and the database behind them) without limit. A non-positive
+	// value disables it.
+	RequestPerMinute int
+	// BanAfter is how many refusals (429s) inside BanWindow turn into a temporary
+	// block of the source address. A non-positive value disables banning.
+	BanAfter int
+	// BanWindow is how long refusals accumulate before they are forgotten.
+	BanWindow time.Duration
+	// BanFor is the first ban's duration; each later ban doubles it.
+	BanFor time.Duration
+	// BanMaxFor caps the escalation, so a repeat offender is never banned forever.
+	BanMaxFor time.Duration
+	// MaxPollsPerIP caps concurrent long polls from one source address. A
+	// non-positive value disables the cap (the hub's global cap still applies).
+	MaxPollsPerIP int
 	// UnlockPerHour bounds password GUESSES per source address and per suffix
 	// (see Server.clipAccess). Only failures are charged, so it needs to be high
 	// enough that an honest reader re-sending its password on every long poll
@@ -92,10 +110,19 @@ func Load() (*Config, error) {
 		MaxTotalBytes: 1 << 30,   // 1 GiB in total
 		WritePerHour:  30,
 		UnlockPerHour: 20,
-		WritesEnabled: true,
-		DefaultTTL:    24 * time.Hour,
-		DBMaxConns:    8,
-		ShareCodeTTL:  30 * time.Minute,
+		// The anti-flood budget. Deliberately generous next to the write budget:
+		// one open tab re-polls about 2.4 times a minute, so even a desk full of
+		// tabs stays far inside 240, while a scraper walking suffixes does not.
+		RequestPerMinute: 240,
+		BanAfter:         5,
+		BanWindow:        10 * time.Minute,
+		BanFor:           15 * time.Minute,
+		BanMaxFor:        24 * time.Hour,
+		MaxPollsPerIP:    8,
+		WritesEnabled:    true,
+		DefaultTTL:       24 * time.Hour,
+		DBMaxConns:       8,
+		ShareCodeTTL:     30 * time.Minute,
 	}
 
 	var err error
@@ -115,6 +142,24 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.WritePerHour, err = envInt("CLIP_WRITE_PER_HOUR", 30); err != nil {
+		return nil, err
+	}
+	if cfg.RequestPerMinute, err = envInt("CLIP_REQUEST_PER_MINUTE", 240); err != nil {
+		return nil, err
+	}
+	if cfg.BanAfter, err = envInt("CLIP_BAN_AFTER", 5); err != nil {
+		return nil, err
+	}
+	if cfg.BanWindow, err = envDuration("CLIP_BAN_WINDOW", 10*time.Minute); err != nil {
+		return nil, err
+	}
+	if cfg.BanFor, err = envDuration("CLIP_BAN_FOR", 15*time.Minute); err != nil {
+		return nil, err
+	}
+	if cfg.BanMaxFor, err = envDuration("CLIP_BAN_MAX_FOR", 24*time.Hour); err != nil {
+		return nil, err
+	}
+	if cfg.MaxPollsPerIP, err = envInt("CLIP_MAX_POLLS_PER_IP", 8); err != nil {
 		return nil, err
 	}
 	if cfg.UnlockPerHour, err = envInt("CLIP_UNLOCK_PER_HOUR", 20); err != nil {
@@ -154,6 +199,21 @@ func Load() (*Config, error) {
 	// deployment should be able to reach by accident.
 	if cfg.UnlockPerHour <= 0 {
 		return nil, fmt.Errorf("CLIP_UNLOCK_PER_HOUR must be positive (got %d)", cfg.UnlockPerHour)
+	}
+	// A ban list is the one defence whose misconfiguration is total: it can refuse
+	// everyone. So the durations are checked as a set, and the escalation is
+	// required to be bounded (Base <= Max), which is what stops a repeat offender
+	// from being banned forever.
+	if cfg.BanAfter > 0 {
+		if cfg.BanWindow <= 0 {
+			return nil, fmt.Errorf("CLIP_BAN_WINDOW must be positive when banning is on (got %s)", cfg.BanWindow)
+		}
+		if cfg.BanFor <= 0 {
+			return nil, fmt.Errorf("CLIP_BAN_FOR must be positive when banning is on (got %s)", cfg.BanFor)
+		}
+		if cfg.BanMaxFor < cfg.BanFor {
+			return nil, fmt.Errorf("CLIP_BAN_MAX_FOR (%s) must not be shorter than CLIP_BAN_FOR (%s)", cfg.BanMaxFor, cfg.BanFor)
+		}
 	}
 	if cfg.DefaultTTL <= 0 {
 		return nil, fmt.Errorf("CLIP_DEFAULT_TTL must be positive (got %s)", cfg.DefaultTTL)

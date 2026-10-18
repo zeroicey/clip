@@ -1,5 +1,62 @@
 # Current task
 
+**Status:** 🚧 **请求级安全中间件（限流 / 封 IP / 安全响应头）** —— 代码 + 单元/真库测试完成，
+**未 commit、未部署**（AGENTS.md：部署前先问人类）。
+**日期：** 2026-10-18 · **决策：** `.ai/decisions/2026-10-18-request-level-security-middleware.md`
+**新陷阱：** `.ai/pitfalls/cases/2026-10-18-banning-the-tunnel-entry-point.md`
+
+## 本轮：请求级安全中间件
+
+**触发**：用户「已经部署到官网上面去了，加一些安全的中间件，比如限流、封 IP」。
+**证据（不是推测）**：翻线上 journald 近 3 天 2962 条请求 → **907 个不同路径**、
+1241×404 / 461×400 / 231×401；明显在扫密钥：`/config/.env`(20)、`/app/.env`(20)、
+`/.aws/config`(16)、`/.vscode/mcp.json`(13)、`/phpinfo.php`(13)、`/static../.git/config`(13)。
+既有防线只有「写限流」和「口令失败限流」，**读路径完全裸奔**，且被限流后没有任何升级手段。
+
+### 新增（全部可关、全部有默认值）
+
+| 层 | 行为 | 环境变量 |
+| --- | --- | --- |
+| 全局安全响应头 | nosniff / X-Frame-Options / Referrer-Policy / X-Robots-Tag / Permissions-Policy / COOP / CORP / CSP 基线；**仅 HTTPS 源发 HSTS** | — |
+| 每 IP 请求预算 | **所有请求**（含读）每 IP **240/分钟** | `CLIP_REQUEST_PER_MINUTE` |
+| 违规→临时封禁 | 10 分钟内 **5 次 429** → 封 **15 分钟**，每次翻倍、上限 **24h** | `CLIP_BAN_AFTER/WINDOW/FOR/MAX_FOR` |
+| 长轮询并发 | 每 IP 最多 **8 个**在等；超了**立即作答**（不是 429） | `CLIP_MAX_POLLS_PER_IP` |
+| 请求体上限 | 全局兜底（handler 仍有更紧的） | 复用既有 asset/body 限额 |
+| 连接头 | `MaxHeaderBytes` 1MiB → **64KiB** | — |
+| access log | 增加解析后的客户端 IP（运维封禁列表需要） | — |
+
+**两条安全规则（写进 ARCHITECTURE 不变量）**：
+1. **只有 429 计违规**，401 绝不计费 —— 未解锁打开上锁 clip 是正常加载，打错密码的人不该被推向封禁。
+2. **可信对端（loopback/私网/隧道入口）永不封禁** —— 直接对端是本地 frpc，没有转发头的请求
+   会归到 `127.0.0.1`，封它 = 封全网。
+
+### 验证（都是实跑）
+
+| 项 | 结果 |
+| --- | --- |
+| `scripts/check.sh` | ✅ 全绿（gofmt + vet + `sqlc diff` 无漂移 + `go test`） |
+| 真库 `scripts/test-pg.sh -count=1`（`relay_test`） | ✅ 全绿 |
+| 新增单元测试（`ratelimit` bans/concurrency、`clientip.IsTrusted`） | ✅ 全绿 |
+| 新增中间件测试（头/预算/封禁/可信对端/401 不计费） | ✅ 7/7 |
+| **反向验证两条承重守卫** | ✅ 把 `IsTrusted` 改成恒 false → `TestATrustedPeerIsNeverBanned` 红；去掉 ban 闸门 → `TestRepeatedRefusalsBanTheSource` 红；恢复后全绿 |
+| 真浏览器 `verify-clip-browser.cjs` 打本机（8797，**生产默认值**） | ✅ **75/75**，含 0 console error / 0 CSP violation；请求日志里 **0 个 429**（240/min 对真实使用毫无压力） |
+| 本机响应头实测（每类形状一条） | ✅ 页面 = nonce CSP、`/api/*` 与错误路径 = 基线 CSP、错误路径也带全部安全头；http 源**不发** HSTS |
+| 夹具与现场 | ✅ `relay_test` 与线上 `relay` 库均 0/0；临时进程已退；线上 `fc88ac7` 未动 |
+| 线上部署 | ⏸ **未做** —— 需人类批准 |
+
+### 未做 / 待人类动作
+
+1. **commit + 部署**（本机就是 hpcore，线上现为 `fc88ac7`）—— 需人类点头。
+2. 部署前冷备 + 部署后跑 runbook (a)-(f) 与线上真浏览器（见 `.ai/runbooks/deploy-clip.md`）。
+3. `CLIP_BAN_*` / `CLIP_REQUEST_PER_MINUTE` / `CLIP_MAX_POLLS_PER_IP` 生产 `clip.env`
+   **未显式写**，走代码默认值（`deploy/clip.env.example` 已记录含义）。
+4. Caddy 层的限流/封禁**未做**（共享主机、跨仓库，且本仓库无法测试）—— 若多地址扫描成为主要噪声再议。
+5. `pg_restore` 恢复演练仍未做（仍是最大运维缺口）。
+
+---
+
+## 上一轮：UI 大换皮（已上线）
+
 **Status:** ✅ **UI 大换皮已上线并验证** —— 线上 = **`fc88ac7`**（干净树构建，可追溯）。
 本轮只改了视觉层（未改任何 id、未改任何被断言的文案、未改行为）。
 **更新：** 2026-10-16（第四会话）· **设计决策：** `.ai/decisions/2026-10-16-ui-visual-direction.md`
