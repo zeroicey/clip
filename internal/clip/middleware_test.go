@@ -79,17 +79,18 @@ func TestSecurityHeadersAreOnEveryResponseShape(t *testing.T) {
 	}
 }
 
-// TestHSTSOnlyWhenThePublicOriginIsHTTPS: an HSTS header from a plain-HTTP
-// origin is a lie the browser remembers for a year, so it must be conditional.
-func TestHSTSOnlyWhenThePublicOriginIsHTTPS(t *testing.T) {
-	plain := testServer(t)
-	if got := do(t, plain, "GET", "/api/health", nil, nil).Header().Get("Strict-Transport-Security"); got != "" {
-		t.Errorf("plain-HTTP origin sent HSTS: %q", got)
-	}
-	secure := testServer(t, func(c *Config) { c.PublicBaseURL = "https://clip.example" })
-	got := do(t, secure, "GET", "/api/health", nil, nil).Header().Get("Strict-Transport-Security")
-	if !strings.Contains(got, "max-age=") {
-		t.Errorf("HTTPS origin did not send HSTS: %q", got)
+// TestNoHSTSFromTheApplication pins that the app leaves HSTS to the TLS layer.
+//
+// The reverse proxy in front of this service already sends it, with a longer
+// max-age and `preload`; a second, weaker header from the app showed up on every
+// live response during the 2026-10-18 deploy. This test is the guard against
+// reintroducing it.
+func TestNoHSTSFromTheApplication(t *testing.T) {
+	for _, base := range []string{"http://test.local", "https://clip.example"} {
+		r := testServer(t, func(c *Config) { c.PublicBaseURL = base })
+		if got := do(t, r, "GET", "/api/health", nil, nil).Header().Get("Strict-Transport-Security"); got != "" {
+			t.Errorf("origin %s: the application sent HSTS (%q); the reverse proxy owns it", base, got)
+		}
 	}
 }
 

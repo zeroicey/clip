@@ -144,9 +144,9 @@ clip 是一个**网络剪贴板**：`https://clip.hcyj.xyz/<后缀>` 打开一�
     **Guarded**：`TestAuthFailuresAloneDoNotBan`。
 11c. **中间件的拒绝形状按命名空间区分**：`/api/*` 走封套，其余 `text/plain`。
     **Guarded**：`TestRepeatedRefusalsBanTheSource`、`TestRequestBudgetCoversReads`。
-11d. **安全响应头是中间件级的**（含错误路径），HTML 页面再用 nonce CSP 覆盖；
-    HSTS 仅在公网源是 HTTPS 时下发。**Guarded**：`TestSecurityHeadersAreOnEveryResponseShape`、
-    `TestHSTSOnlyWhenThePublicOriginIsHTTPS`。
+11d. **安全响应头是中间件级的**（含错误路径），HTML 页面再用 nonce CSP 覆盖。
+    **HSTS 归 TLS 层（Caddy），应用不发** —— 两边同时发会在线上产生两个同名头。
+    **Guarded**：`TestSecurityHeadersAreOnEveryResponseShape`、`TestNoHSTSFromTheApplication`。
 12. **schema 不漂移**：迁移目录是唯一真源，sqlc 读同一批文件，`sqlc diff` 在闸门里。
 
 ## 6. 边界与已知代价

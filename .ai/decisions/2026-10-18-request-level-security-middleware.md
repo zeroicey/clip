@@ -48,7 +48,7 @@
    本服务的直接对端是本地 frpc，**没有转发头的请求会归到 127.0.0.1** —— 封它等于一封封掉全网。
 
 另外：全局安全响应头中间件（nosniff / X-Frame-Options / Referrer-Policy / X-Robots-Tag /
-Permissions-Policy / COOP / CORP / CSP 基线；**HTTPS 公网源才发 HSTS**），
+Permissions-Policy / COOP / CORP / CSP 基线；**HSTS 不发 —— 属于 TLS 层，Caddy 已经发了**），
 请求体总上限中间件，`MaxHeaderBytes=64KiB`，每 IP 长轮询并发上限（`CLIP_MAX_POLLS_PER_IP=8`，
 超了**立即作答**而不是 429），以及 access log 增加解析后的客户端 IP（运维封禁列表需要它）。
 
@@ -71,3 +71,10 @@ Permissions-Policy / COOP / CORP / CSP 基线；**HTTPS 公网源才发 HSTS**�
 - 线上出现「合法用户被封」的实例（NAT / 移动网络）→ 提高 `CLIP_BAN_AFTER` 或改为只封更长窗口。
 - 请求级 240/min 在真实使用中触发（浏览器验证脚本或人）→ 提高它，或把长轮询从预算里剔除。
 - 多地址扫描成为主要噪声 → 需要前缀级（IPv6 /64）或 Caddy 层配合，届时另开 decision。
+
+## 部署当天补记（2026-10-18）
+
+首次上线后，**线上实测**抓到中间件多发了一个 `Strict-Transport-Security`（Caddy 已经发了
+更强的那条）—— 已删掉并加守卫。详见
+`.ai/pitfalls/cases/2026-10-18-duplicate-security-header-with-the-proxy.md`。
+教训：安全头的归属必须按层划分（TLS 层归反代，内容层归应用），而**代理层的重复只能靠线上实测发现**。

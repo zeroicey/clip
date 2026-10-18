@@ -39,11 +39,15 @@ import (
 // on the error path is missing where it matters most. Handlers that need a
 // different value replace it: the HTML pages install a per-response nonce policy
 // and /raw installs a sandbox one, both of which overwrite the baseline set here.
+//
+// HSTS is deliberately NOT set here. It belongs to the TLS layer, and the
+// reverse proxy in front of this service already sends it (with a longer max-age
+// and `preload`). Setting it here too produced two Strict-Transport-Security
+// headers on every live response — a browser processes only the first, so the
+// duplicate was harmless in effect and still a contract lie. Two headers for one
+// policy is the same failure family as the duplicate CSP recorded in
+// .ai/pitfalls/cases/2026-10-18-duplicate-security-header-with-the-proxy.md.
 func (s *Server) securityHeaders() gin.HandlerFunc {
-	// HSTS is only true when the public origin is HTTPS. A development origin is
-	// plain HTTP, and an HSTS header sent from there would be a lie the browser
-	// remembers for a year.
-	hsts := strings.HasPrefix(s.cfg.PublicBaseURL, "https://")
 	return func(c *gin.Context) {
 		h := c.Writer.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
@@ -63,9 +67,6 @@ func (s *Server) securityHeaders() gin.HandlerFunc {
 		// and /raw replace it with a policy tailored to their content.
 		h.Set("Content-Security-Policy",
 			"default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-		if hsts {
-			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		}
 		c.Next()
 	}
 }
