@@ -1,11 +1,36 @@
 # Current task
 
-**Status:** 🚧 **请求级安全中间件（限流 / 封 IP / 安全响应头）** —— 代码 + 单元/真库测试完成，
-**未 commit、未部署**（AGENTS.md：部署前先问人类）。
+**Status:** ✅ **已上线并线上验证** —— 线上 = **`f01cdd0`**（干净树构建，可追溯）。
 **日期：** 2026-10-18 · **决策：** `.ai/decisions/2026-10-18-request-level-security-middleware.md`
-**新陷阱：** `.ai/pitfalls/cases/2026-10-18-banning-the-tunnel-entry-point.md`
+**新陷阱：** `.ai/pitfalls/cases/2026-10-18-banning-the-tunnel-entry-point.md`、
+`.ai/pitfalls/cases/2026-10-18-duplicate-security-header-with-the-proxy.md`
 
-## 本轮：请求级安全中间件
+## 线上验证（都是实跑，2026-10-18）
+
+| 项 | 结果 |
+| --- | --- |
+| 升级前冷备 | ✅ `/data/backups/clip-20261018-233206.dump`，`pg_restore -l` 可读（17 TOC 项，`dbname: relay`） |
+| 回滚副本 | ✅ `/data/backups/clip-binary-prefc88ac7-sec-20261018-233206` |
+| (a)(b)(c) 连通性 | ✅ 本机 200 / hcyj 隧道 200 + REACHABLE / 公网 `verify=0 http=200` |
+| (d) 契约形状 | ✅ 9/9（`/api/nope`=JSON、`/a/b/c`=text/plain、`/neversuch`=200、`robots` HEAD=200、`POST /ops1`=405） |
+| (d2) 安全响应头 | ✅ 每个头**恰好 1 次**；HSTS 只剩 Caddy 那条；页面 CSP 仍 nonce、`unsafe-inline` 0 次 |
+| (e)+(f) 产品码 | ✅ **19/19**（密码 8 项 + 分享 11 项） |
+| 真浏览器打线上 | ✅ **75/75**（0 console error / 0 CSP violation / 0 unexpected failed request） |
+| 线上中间件是否误伤 | ✅ 浏览器跑的客户端 `121.9.113.18` **零 429 / 零 403**；15 分钟内的 429 **全部**来自我自己的 127.0.0.1 压力测试（247×200/270×429/**0×403**）；`banned address` 日志 0 条 |
+| 大陆观测点 hcyj / koma | ✅ 均 `verify=0 http=200`、`/s/<未知>`=404、`/`=200 |
+| **运行时证明新层生效** | ✅ 对本机 8790 连打 260 次：**247×200 / 270×429 / 0×403**；窗口过后恢复 200；`banned address` 日志 **0 条**（可信对端永不封） |
+| 可追溯 | ✅ 线上 `version` = `f01cdd0` = HEAD；干净树；部署后无 `cmd/ internal/ scripts/ deploy/` 改动；二进制 sha256 与本地干净构建一致 |
+| 夹具与库 | ✅ `relay` 与 `relay_test` 均 0/0 |
+
+### 部署当天抓到并修掉的真问题（本地测试全绿，**只有线上实测才能发现**）
+
+首次上线后线上响应头实测发现每个响应有**两个** `Strict-Transport-Security`：
+Caddy 的 `max-age=63072000; includeSubDomains; preload` 与中间件新加的
+`max-age=31536000; includeSubDomains`。Caddyfile 本来就写明 HSTS 属于 TLS 层，
+所以应用侧那条是错的。已删掉并加守卫（`TestNoHSTSFromTheApplication`），重新构建部署为
+`f01cdd0`。详见陷阱 `2026-10-18-duplicate-security-header-with-the-proxy.md`。
+
+## 本轮：请求级安全中间件（原始记录）
 
 **触发**：用户「已经部署到官网上面去了，加一些安全的中间件，比如限流、封 IP」。
 **证据（不是推测）**：翻线上 journald 近 3 天 2962 条请求 → **907 个不同路径**、
@@ -17,7 +42,7 @@
 
 | 层 | 行为 | 环境变量 |
 | --- | --- | --- |
-| 全局安全响应头 | nosniff / X-Frame-Options / Referrer-Policy / X-Robots-Tag / Permissions-Policy / COOP / CORP / CSP 基线；**仅 HTTPS 源发 HSTS** | — |
+| 全局安全响应头 | nosniff / X-Frame-Options / Referrer-Policy / X-Robots-Tag / Permissions-Policy / COOP / CORP / CSP 基线；**HSTS 不发（归 TLS 层，Caddy 已发）** | — |
 | 每 IP 请求预算 | **所有请求**（含读）每 IP **240/分钟** | `CLIP_REQUEST_PER_MINUTE` |
 | 违规→临时封禁 | 10 分钟内 **5 次 429** → 封 **15 分钟**，每次翻倍、上限 **24h** | `CLIP_BAN_AFTER/WINDOW/FOR/MAX_FOR` |
 | 长轮询并发 | 每 IP 最多 **8 个**在等；超了**立即作答**（不是 429） | `CLIP_MAX_POLLS_PER_IP` |
@@ -41,17 +66,19 @@
 | **反向验证两条承重守卫** | ✅ 把 `IsTrusted` 改成恒 false → `TestATrustedPeerIsNeverBanned` 红；去掉 ban 闸门 → `TestRepeatedRefusalsBanTheSource` 红；恢复后全绿 |
 | 真浏览器 `verify-clip-browser.cjs` 打本机（8797，**生产默认值**） | ✅ **75/75**，含 0 console error / 0 CSP violation；请求日志里 **0 个 429**（240/min 对真实使用毫无压力） |
 | 本机响应头实测（每类形状一条） | ✅ 页面 = nonce CSP、`/api/*` 与错误路径 = 基线 CSP、错误路径也带全部安全头；http 源**不发** HSTS |
-| 夹具与现场 | ✅ `relay_test` 与线上 `relay` 库均 0/0；临时进程已退；线上 `fc88ac7` 未动 |
-| 线上部署 | ⏸ **未做** —— 需人类批准 |
+| 夹具与现场 | ✅ `relay_test` 与线上 `relay` 库均 0/0；临时进程已退 |
+| 线上部署 | ✅ 已做（`799a02d` → 修 HSTS → `f01cdd0`，见上方线上验证） |
 
-### 未做 / 待人类动作
+### 剩余 / 待人类动作
 
-1. **commit + 部署**（本机就是 hpcore，线上现为 `fc88ac7`）—— 需人类点头。
-2. 部署前冷备 + 部署后跑 runbook (a)-(f) 与线上真浏览器（见 `.ai/runbooks/deploy-clip.md`）。
+1. ✅ **commit + 部署已完成**（人类批准后执行，线上 `f01cdd0`）。
+2. ✅ 冷备 + runbook (a)-(f) + 线上真浏览器已完成。
 3. `CLIP_BAN_*` / `CLIP_REQUEST_PER_MINUTE` / `CLIP_MAX_POLLS_PER_IP` 生产 `clip.env`
-   **未显式写**，走代码默认值（`deploy/clip.env.example` 已记录含义）。
+   **未显式写**，走代码默认值（人类裁定；`deploy/clip.env.example` 已记录含义）。
 4. Caddy 层的限流/封禁**未做**（共享主机、跨仓库，且本仓库无法测试）—— 若多地址扫描成为主要噪声再议。
 5. `pg_restore` 恢复演练仍未做（仍是最大运维缺口）。
+6. **封禁只看得到多地址攻击的边界**：按 IP 封不住一个 IPv6 /64 或一批代理；真正的兜底仍是 store 全局配额。
+   真实使用中出现误封（NAT/移动网络）就先调 `CLIP_BAN_AFTER`。
 
 ---
 

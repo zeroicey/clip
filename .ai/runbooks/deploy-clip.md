@@ -1,9 +1,12 @@
 # 部署 clip（线上已就绪）
 
 **Applies to:** clip 服务（后端在 `hpcore`，公网入口在 `hcyj`）
-· **Owner:** lead · **Last verified:** 2026-10-16（证书已签发、公网 27/27 真浏览器 + 大陆观测点全绿）；
+· **Owner:** lead · **Last verified:** 2026-10-18（请求级安全中间件上线：线上 `f01cdd0`，
+三条连通性 + d) 契约 9/9 + d2) 安全头逐个一次 + e/f) 产品码 19/19 + 真浏览器 75/75 +
+hcyj/koma 观测点全绿；部署当天抓到并修掉了重复 HSTS）
+（2026-10-16 证书已签发、公网 27/27 真浏览器 + 大陆观测点全绿；
 同日第二会话：修复 HEAD 掉进 NoRoute 后重新部署（`13ad95d`），三条检查 + d) 契约 9/9 +
-真浏览器 27/27 + hcyj/koma 观测点全绿
+真浏览器 27/27 + hcyj/koma 观测点全绿）
 
 ## 形态
 
@@ -75,6 +78,19 @@ curl -s -o /dev/null -w '%{content_type}\n' https://clip.hcyj.xyz/a/b/c       # 
 curl -s -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/neversuch      # 200（第一次访问即创建）
 curl -sI -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/robots.txt    # 200（不是 400）
 curl -s -X POST -o /dev/null -w '%{http_code}\n' https://clip.hcyj.xyz/ops1    # 405（公共路径只服务 GET/HEAD）
+
+# d2) 安全响应头（改过中间件 / 安全头时必须）—— 每个头必须**恰好一次**。
+# 特别是 HSTS：只能有 Caddy 那一条（max-age=63072000; preload），应用不发。
+# 两边同时发会在线上出现两个同名头，而本地测试看不到代理那一半。
+# 见 pitfalls/cases/2026-10-18-duplicate-security-header-with-the-proxy.md。
+H() { curl -s -D- -o /dev/null https://clip.hcyj.xyz/api/health | tr -d '\r' | grep -ci "^$1:"; }
+for h in strict-transport-security x-content-type-options x-frame-options referrer-policy \
+         x-robots-tag content-security-policy cross-origin-opener-policy permissions-policy; do
+  printf '%-28s %s\n' "$h" "$(H "$h")"   # 每一项都必须 1；hsts 那条来自 Caddy
+  # 页面路径的 CSP 必须仍是 nonce，且全站 0 个 unsafe-inline：
+  # curl -s -D- -o /dev/null https://clip.hcyj.xyz/ | tr -d '\r' | grep -c 'nonce-'
+  # curl -s -D- -o /dev/null https://clip.hcyj.xyz/ | tr -d '\r' | grep -c 'unsafe-inline'
+done
 
 # e) 密码那套（改过密码/读路径时必须）—— 用一个真 clip 走一遍：
 SFX=deploycheck$RANDOM
@@ -150,6 +166,30 @@ sudo systemctl restart clip     # 读/raw/图片照旧，PUT/POST/DELETE 返回 
 
 分享口令的猜测与 clip 密码**共用** `CLIP_UNLOCK_PER_HOUR` 与同一个 limiter，桶键是
 `ip:<地址>` 与 `share:<token>`（后缀那个桶是 `suffix:<后缀>`，互不干扰）。
+
+## 请求级安全中间件的旋钮（2026-10-18 上线）
+
+这一层在 handler 之前生效（`internal/clip/middleware.go`）：全局安全响应头、
+每 IP 请求预算（**含读**）、违规→临时封禁、请求体上限。生产 `clip.env` **没有显式写**
+这些值，走代码默认值（与 `CLIP_UNLOCK_PER_HOUR` / `CLIP_SHARE_CODE_TTL` 同一做法）；
+改它们后 `systemctl restart clip` 生效。
+
+| 环境变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `CLIP_REQUEST_PER_MINUTE` | 240 | 每个源地址**每分钟**的全部请求预算（读也算）。0 = 关 |
+| `CLIP_BAN_AFTER` | 5 | 窗口内累计多少次 **429** 就临时封禁。**401 不计费**。0 = 关封禁 |
+| `CLIP_BAN_WINDOW` | 10m | 违规累计窗口（过后忘记） |
+| `CLIP_BAN_FOR` | 15m | 第一次封禁时长；每次翻倍 |
+| `CLIP_BAN_MAX_FOR` | 24h | 封禁时长上限（必须 ≥ `CLIP_BAN_FOR`） |
+| `CLIP_MAX_POLLS_PER_IP` | 8 | 每个源地址可同时挂着的长轮询数；超了**立即作答**（不是 429）。0 = 关 |
+
+**封禁是进程内的**：`systemctl restart clip` 即清空，与既有 limiter 一致。
+**可信对端（loopback/私网/隧道入口）永不封禁** —— 直接对端是本地 frpc，没有转发头的请求
+会归到 `127.0.0.1`，封它 = 封全网。见
+`.ai/pitfalls/cases/2026-10-18-banning-the-tunnel-entry-point.md`。
+
+**排障**：`journalctl -u clip | grep banned` 看封禁事件（含 ip/reason/duration）；
+access log 现在每条都带解析后的 `ip` 字段。
 
 ### 自测会把写预算刷爆（踩过，别当成产品 bug）
 
